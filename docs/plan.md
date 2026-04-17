@@ -17,7 +17,7 @@ Success = the agent autonomously dials the mock payer, correctly navigates a DTM
 | **Voice pipeline framework** | **Pipecat** (Python) | Handles Twilio WebSocket transport, VAD, barge-in, TTS interruption, turn-taking out of the box. Lets us focus on hybrid control logic, not audio plumbing. |
 | **State machine** | **LangGraph** (`StateGraph` with typed `TypedDict` state, explicit nodes, conditional edges) | Industry standard. You'll dig into the internals wherever something is opaque. **Critical:** LangGraph runs *alongside* the Pipecat pipeline, not embedded inside a FrameProcessor — see design section. |
 | **Telephony** | **Twilio** (Media Streams for audio; REST API `sendDigits` or stream `dtmf` events for mid-call DTMF) | Industry standard. Two numbers: one for the agent, one for the mock payer. `<Play digits>` does **not** work inside an active Media Streams session — mid-stream DTMF injection must be verified explicitly (see M5). |
-| **Twilio account tier** | **Pay-as-you-go for the agent account; trial is fine for the mock payer** | Trial restrictions only bite on outbound: prepended voicemail message, verified-destinations-only, DTMF timing drift. The mock payer only *receives* inbound calls, so trial is fine there. Budget ~$20 to upgrade the agent account only. |
+| **Twilio account tier** | **Trial through M4, upgrade at M5** | Correction from prior research: the trial message plays on BOTH outbound AND inbound trial calls, and it requires a press-any-key human gate to advance. That kills the automated mock-payer plan. For M2–M4 the agent dials the user's SMS-verified personal cell, user role-plays the "payer" and presses the key once per call. At M5 the agent must dial an automated TwiML IVR that cannot press keys — upgrade the account then (~$20 one-time). Single upgraded account hosts both agent and mock-payer numbers (~$2.30/mo for 2 numbers). |
 | **ASR** | **Deepgram Nova-3** (streaming WebSocket) | Sub-300ms, strong VAD/endpointing. Tune `endpointing` and `utterance_end_ms` explicitly in M2 — don't leave defaults. |
 | **TTS** | **Cartesia Sonic-3** | 40ms time-to-first-audio — current industry leader. Critical for barge-in feel. |
 | **LLM (structured extraction)** | **Kimi K2 on Groq** (`moonshotai/kimi-k2-instruct`) | Groq's strict `response_format: json_schema` is only supported on Kimi K2, Llama 4 Maverick, and Llama 4 Scout. Qwen3-32B only supports loose `json_object`, which would force a validate-and-retry wrapper. Kimi K2 binds directly to Pydantic. ~$1/$3 per M tokens. Used ONLY for `extract_benefits`. |
@@ -372,7 +372,8 @@ voiceadmin-learn/
 ## Build order (milestones)
 
 1. **M1 — Env, keys, and hygiene baseline.**
-   - Sign up: Twilio (**upgrade agent account only off trial, ~$20; mock payer can stay on trial since it only receives inbound calls**), Cartesia, Groq. Deepgram already done.
+   - Sign up: Twilio (**trial for now — upgrade deferred to M5**), Cartesia, Groq. Deepgram already done.
+   - On the Twilio trial account: SMS-verify the user's personal cell as a Verified Caller ID so the agent can dial it during M2–M4 manual role-play. Only one Twilio number needed at this stage (the trial-issued number = `TWILIO_AGENT_NUMBER`). `ALLOWED_DESTINATIONS` = user's personal cell (E.164).
    - `uv init` + install Pipecat, LangGraph, Groq SDK, Cartesia SDK, Deepgram SDK, FastAPI, structlog, pydantic-settings, python-dotenv (all pinned exactly). Commit `uv.lock`.
    - Install dev deps: `ruff`, `pyright`, `pytest`, `pytest-asyncio`, `pre-commit`. Configure basic ruff + pyright rules; install the pre-commit hook.
    - Write `README.md` with setup instructions and a `Makefile` with `agent`, `mock-payer`, `test`, `lint` targets.
@@ -411,8 +412,9 @@ voiceadmin-learn/
    - Add Langfuse via LangGraph's native tracing integration (env var + callback handler). Verify trace tree shows node transitions and LLM calls.
    - Call the agent from your cell phone, manually role-play the payer IVR. Verify node transitions in Langfuse.
 
-5. **M5 — DTMF spike, then mock payer (IVR leg).**
-   - **Spike first:** verify mid-stream DTMF injection actually works. Place a test call into Media Streams, call `sendDigits` on the call SID, confirm the remote side receives DTMF. **Do not build the IVR tree until this works.**
+5. **M5 — Upgrade Twilio, DTMF spike, then mock payer (IVR leg).**
+   - **Upgrade first** (~$20 one-time deposit). Automated IVR requires no trial-message gate, which only an upgraded account provides. Buy a second number on the upgraded account for the mock payer (~$1.15/mo). Update `TWILIO_PAYER_NUMBER` and add it to `ALLOWED_DESTINATIONS`.
+   - **DTMF spike:** verify mid-stream DTMF injection actually works. Place a test call into Media Streams, call `sendDigits` on the call SID, confirm the remote side receives DTMF. **Do not build the IVR tree until this works.**
    - Then build mock payer: FastAPI + TwiML `<Gather>` tree. Simple and deterministic.
    - Agent dials mock payer. Happy path: blast through IVR, reach "rep handoff" state.
 
