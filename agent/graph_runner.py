@@ -32,11 +32,19 @@ class CallContext:
 class GraphRunner:
     """One per call. Consume transcripts, drive the graph, emit responses."""
 
-    def __init__(self, graph: CompiledStateGraph, call_ctx: CallContext) -> None:
+    def __init__(
+        self,
+        graph: CompiledStateGraph,
+        call_ctx: CallContext,
+        *,
+        queue_max: int = QUEUE_MAX,
+        recursion_limit: int = RECURSION_LIMIT,
+    ) -> None:
         self.graph = graph
         self.call_ctx = call_ctx
-        self.in_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_MAX)
-        self.out_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_MAX)
+        self.recursion_limit = recursion_limit
+        self.in_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_max)
+        self.out_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_max)
         self.state: CallState = initial_state(call_ctx.patient)
         self._consumer: asyncio.Task[None] | None = None
         self._current_turn: asyncio.Task[CallState] | None = None
@@ -131,12 +139,15 @@ class GraphRunner:
         try:
             result = await self.graph.ainvoke(
                 turn_state,
-                config={"recursion_limit": RECURSION_LIMIT},
+                config={"recursion_limit": self.recursion_limit},
             )
         except GraphRecursionError:
             log.warning("graph_recursion_limit")
             return self._hard_fallback("recursion_limit")
         except Exception as exc:  # noqa: BLE001
+            # Scope this to the graph invocation only. If _hard_fallback
+            # itself raises (a real bug), we want the exception to propagate
+            # to _consume rather than silently emit another fallback.
             log.exception("node_error", error=str(exc))
             return self._hard_fallback("node_exception")
 

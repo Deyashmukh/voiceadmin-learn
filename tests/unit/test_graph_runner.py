@@ -241,6 +241,17 @@ async def test_state_is_committed_before_response_published(
         await runner.stop()
 
 
+async def test_ctor_overrides_queue_max_and_recursion_limit(
+    patient: PatientInfo, fake_llm: FakeLLMClient, fake_classifier: FakeClassifier
+) -> None:
+    graph = build_graph(fake_llm, fake_classifier)
+    runner = GraphRunner(graph, _ctx(patient), queue_max=2, recursion_limit=3)
+    assert runner.recursion_limit == 3
+    for i in range(5):
+        runner.submit_transcript(f"item-{i}")
+    assert runner.in_queue.qsize() == 2
+
+
 async def test_contextvars_propagate_into_run_turn(
     patient: PatientInfo, fake_classifier: FakeClassifier
 ) -> None:
