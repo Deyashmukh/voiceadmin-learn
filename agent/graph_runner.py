@@ -74,8 +74,11 @@ class GraphRunner:
 
     def mark_interrupted(self) -> None:
         """Cancel the in-flight turn. Must be called from the event-loop thread."""
-        self._interrupt_requested = True
+        # Only set the flag when there's a real turn to cancel. Setting it
+        # between turns would leave it stuck True and conflate a future
+        # stop() cancellation with an interrupt.
         if self._current_turn and not self._current_turn.done():
+            self._interrupt_requested = True
             self._current_turn.cancel()
 
     async def _consume(self) -> None:
@@ -117,6 +120,13 @@ class GraphRunner:
         }
 
     async def _run_turn(self, transcript: str) -> CallState:
+        # create_task inherits the consumer's contextvars, but re-bind defensively
+        # so a future refactor that spawns _run_turn from a different context
+        # doesn't silently lose the call_sid tag on node-level logs.
+        structlog.contextvars.bind_contextvars(
+            call_sid=self.call_ctx.call_sid,
+            turn_index=self.state.get("turn_count", 0),
+        )
         turn_state: CallState = {**self.state, "transcript": transcript}
         try:
             result = await self.graph.ainvoke(
