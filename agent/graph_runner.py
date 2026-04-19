@@ -15,30 +15,18 @@ import structlog
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 
+from agent.graph import initial_state
 from agent.logging_config import log
-from agent.schemas import CallState, PatientInfo
+from agent.schemas import FALLBACK_RESPONSE, CallState, PatientInfo
 
 QUEUE_MAX = 8
 RECURSION_LIMIT = 10
-FALLBACK_RESPONSE = "Sorry, could you repeat that?"
 
 
 @dataclass
 class CallContext:
     call_sid: str
     patient: PatientInfo
-
-
-def _initial_state(ctx: CallContext) -> CallState:
-    return {
-        "current_node": "auth",
-        "patient": ctx.patient,
-        "extracted": None,
-        "turn_count": 0,
-        "transcript": "",
-        "response_text": None,
-        "fallback_reason": None,
-    }
 
 
 class GraphRunner:
@@ -49,7 +37,7 @@ class GraphRunner:
         self.call_ctx = call_ctx
         self.in_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_MAX)
         self.out_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_MAX)
-        self.state: CallState = _initial_state(call_ctx)
+        self.state: CallState = initial_state(call_ctx.patient)
         self._consumer: asyncio.Task[None] | None = None
         self._current_turn: asyncio.Task[CallState] | None = None
         self._interrupt_requested: bool = False
@@ -67,8 +55,11 @@ class GraphRunner:
                 continue
             try:
                 await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except asyncio.CancelledError:
                 pass
+            except Exception as exc:  # noqa: BLE001
+                # A task that crashed during shutdown is still a real bug — don't silently swallow.
+                log.warning("task_error_during_stop", task=task.get_name(), error=str(exc))
 
     def submit_transcript(self, text: str) -> None:
         """Non-blocking enqueue with drop-oldest on full. Callable from Pipecat."""
@@ -82,7 +73,7 @@ class GraphRunner:
             self.in_queue.put_nowait(text)
 
     def mark_interrupted(self) -> None:
-        """Cancel the in-flight turn. Safe to call from the Pipecat thread."""
+        """Cancel the in-flight turn. Must be called from the event-loop thread."""
         self._interrupt_requested = True
         if self._current_turn and not self._current_turn.done():
             self._current_turn.cancel()
@@ -116,6 +107,15 @@ class GraphRunner:
             if response:
                 await self.out_queue.put(response)
 
+    def _hard_fallback(self, reason: str) -> CallState:
+        return {
+            **self.state,
+            "current_node": "done",
+            "fallback_reason": reason,
+            "response_text": FALLBACK_RESPONSE,
+            "turn_count": self.state.get("turn_count", 0) + 1,
+        }
+
     async def _run_turn(self, transcript: str) -> CallState:
         turn_state: CallState = {**self.state, "transcript": transcript}
         try:
@@ -125,23 +125,11 @@ class GraphRunner:
             )
         except GraphRecursionError:
             log.warning("graph_recursion_limit")
-            return {
-                **self.state,
-                "current_node": "done",
-                "fallback_reason": "recursion_limit",
-                "response_text": FALLBACK_RESPONSE,
-                "turn_count": self.state.get("turn_count", 0) + 1,
-            }
+            return self._hard_fallback("recursion_limit")
         except Exception as exc:  # noqa: BLE001
             log.exception("node_error", error=str(exc))
-            return {
-                **self.state,
-                "current_node": "done",
-                "fallback_reason": "node_exception",
-                "response_text": FALLBACK_RESPONSE,
-                "turn_count": self.state.get("turn_count", 0) + 1,
-            }
+            return self._hard_fallback("node_exception")
 
-        new_state: CallState = dict(result)  # type: ignore[assignment]
+        new_state: CallState = result  # type: ignore[assignment]
         new_state["turn_count"] = self.state.get("turn_count", 0) + 1
         return new_state

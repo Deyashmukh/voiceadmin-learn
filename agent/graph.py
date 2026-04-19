@@ -17,7 +17,14 @@ from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
 from agent.logging_config import log
-from agent.schemas import Benefits, CallState, IVRClassifier, LLMClient, PatientInfo
+from agent.schemas import (
+    FALLBACK_RESPONSE,
+    Benefits,
+    CallState,
+    IVRClassifier,
+    LLMClient,
+    PatientInfo,
+)
 
 NODES = ("auth", "patient_id", "extract_benefits", "handoff", "fallback", "done")
 
@@ -34,6 +41,14 @@ def initial_state(patient: PatientInfo) -> CallState:
     }
 
 
+def _to_fallback(reason: str, response: str = FALLBACK_RESPONSE) -> CallState:
+    return {
+        "current_node": "fallback",
+        "fallback_reason": reason,
+        "response_text": response,
+    }
+
+
 def _route_from_dispatcher(state: CallState) -> str:
     node = state.get("current_node", "fallback")
     if node not in NODES:
@@ -42,22 +57,17 @@ def _route_from_dispatcher(state: CallState) -> str:
     return node
 
 
-def _dispatcher(state: CallState) -> dict:
-    """Pure pass-through. Conditional edges do the routing."""
+def _dispatcher(state: CallState) -> CallState:
     return {}
 
 
 def build_graph(llm: LLMClient, classifier: IVRClassifier) -> CompiledStateGraph:
     """Compile the graph with dependencies captured in handler closures."""
 
-    async def auth_handler(state: CallState) -> dict:
+    async def auth_handler(state: CallState) -> CallState:
         patient = state.get("patient")
         if patient is None:
-            return {
-                "current_node": "fallback",
-                "fallback_reason": "auth_missing_patient",
-                "response_text": "Sorry, I don't have caller info.",
-            }
+            return _to_fallback("auth_missing_patient", "Sorry, I don't have caller info.")
         transcript = state.get("transcript", "").lower()
         if "ready" in transcript or "go ahead" in transcript or state.get("turn_count", 0) == 0:
             return {
@@ -72,28 +82,19 @@ def build_graph(llm: LLMClient, classifier: IVRClassifier) -> CompiledStateGraph
             "response_text": "I'm calling to verify eligibility. Are you ready?",
         }
 
-    async def patient_id_handler(state: CallState) -> dict:
-        # Simple gate: once we've said the patient info and got any acknowledgement,
-        # proceed to extraction. Real IVR handling comes at M5.
-        transcript = state.get("transcript", "")
-        result = classifier.classify(transcript)
-        if result.outcome == "speak":
-            return {"current_node": "extract_benefits"}
+    async def patient_id_handler(state: CallState) -> CallState:
+        # Real IVR keyword handling lands at M5. For now, any classifier outcome
+        # advances to extraction; DTMF additionally emits the tone string.
+        result = classifier.classify(state.get("transcript", ""))
+        out: CallState = {"current_node": "extract_benefits"}
         if result.outcome == "dtmf":
-            return {
-                "current_node": "extract_benefits",
-                "response_text": f"DTMF {result.dtmf} sent.",
-            }
-        return {"current_node": "extract_benefits"}
+            out["response_text"] = f"DTMF {result.dtmf} sent."
+        return out
 
-    async def extract_benefits_handler(state: CallState) -> dict:
+    async def extract_benefits_handler(state: CallState) -> CallState:
         transcript = state.get("transcript", "")
         if not transcript:
-            return {
-                "current_node": "fallback",
-                "fallback_reason": "extract_no_transcript",
-                "response_text": "Sorry, could you repeat that?",
-            }
+            return _to_fallback("extract_no_transcript")
         try:
             benefits = await llm.complete_structured(
                 system=(
@@ -105,41 +106,33 @@ def build_graph(llm: LLMClient, classifier: IVRClassifier) -> CompiledStateGraph
             )
         except (ValidationError, json.JSONDecodeError, ValueError) as exc:
             log.warning("extract_malformed", error=str(exc))
-            return {
-                "current_node": "fallback",
-                "fallback_reason": "extract_malformed_output",
-                "response_text": "Sorry, could you repeat that?",
-            }
+            return _to_fallback("extract_malformed_output")
         return {
             "current_node": "handoff",
             "extracted": benefits,
             "response_text": "Got it, thank you.",
         }
 
-    async def handoff_handler(state: CallState) -> dict:
-        # Once we've got Benefits, the call is effectively done.
+    async def handoff_handler(state: CallState) -> CallState:
         if state.get("extracted") is None:
-            return {
-                "current_node": "fallback",
-                "fallback_reason": "handoff_no_benefits",
-                "response_text": "Sorry, could you repeat that?",
-            }
+            return _to_fallback("handoff_no_benefits")
         return {
             "current_node": "done",
             "response_text": "Thanks, goodbye.",
         }
 
-    async def fallback_handler(state: CallState) -> dict:
-        # Idempotent: if we landed here without a reason, record one.
+    async def fallback_handler(state: CallState) -> CallState:
         reason = state.get("fallback_reason") or "unspecified"
         log.info("fallback_reached", reason=reason)
         return {
             "current_node": "done",
-            "response_text": state.get("response_text") or "Sorry, could you repeat that?",
+            "response_text": state.get("response_text") or FALLBACK_RESPONSE,
             "fallback_reason": reason,
         }
 
-    async def done_handler(state: CallState) -> dict:
+    async def done_handler(state: CallState) -> CallState:
+        # Unreachable in the normal runner loop (consumer exits on current_node=='done'),
+        # but kept so forcing current_node='done' into ainvoke doesn't raise.
         return {"current_node": "done"}
 
     builder = StateGraph(CallState)

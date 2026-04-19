@@ -8,7 +8,7 @@ import pytest
 
 from agent.graph import build_graph
 from agent.graph_runner import QUEUE_MAX, CallContext, GraphRunner
-from agent.schemas import PatientInfo
+from agent.schemas import FALLBACK_RESPONSE, PatientInfo
 
 from .conftest import FakeClassifier, FakeLLMClient
 
@@ -107,7 +107,7 @@ async def test_handler_exception_routes_to_fallback(
     try:
         runner.submit_transcript("anything")
         out = await asyncio.wait_for(runner.out_queue.get(), timeout=1.0)
-        assert out == "Sorry, could you repeat that?"
+        assert out == FALLBACK_RESPONSE
         assert runner.state.get("current_node") == "done"
         assert runner.state.get("fallback_reason") == "node_exception"
     finally:
@@ -138,7 +138,7 @@ async def test_unknown_node_in_state_routes_through_fallback(
     try:
         runner.submit_transcript("anything")
         out = await asyncio.wait_for(runner.out_queue.get(), timeout=1.0)
-        assert out == "Sorry, could you repeat that?"
+        assert out == FALLBACK_RESPONSE
         assert runner.state.get("current_node") == "done"
     finally:
         await runner.stop()

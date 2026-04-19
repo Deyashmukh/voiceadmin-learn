@@ -6,6 +6,8 @@ from typing import Literal, Protocol, TypedDict
 
 from pydantic import BaseModel, Field
 
+FALLBACK_RESPONSE = "Sorry, could you repeat that?"
+
 
 class PatientInfo(BaseModel):
     """Caller/subscriber info we authenticate with on the payer call."""

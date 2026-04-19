@@ -15,19 +15,17 @@ from agent.schemas import Benefits, ClassifierResult, PatientInfo
 class FakeLLMClient:
     """Deterministic fake. Queue up responses per method; raise to simulate errors."""
 
-    free_form_responses: list[str] = field(default_factory=list)
     structured_responses: list[BaseModel] = field(default_factory=list)
     structured_exception: Exception | None = None
     slow_mode_seconds: float = 0.0
     calls: list[tuple[str, str, str]] = field(default_factory=list)
 
     async def complete_free_form(self, system: str, user: str) -> str:
+        # No M3 node uses free-form completion; Protocol requires the method.
         self.calls.append(("free_form", system, user))
         if self.slow_mode_seconds:
             await asyncio.sleep(self.slow_mode_seconds)
-        if not self.free_form_responses:
-            return ""
-        return self.free_form_responses.pop(0)
+        return ""
 
     async def complete_structured[T: BaseModel](self, system: str, user: str, schema: type[T]) -> T:
         self.calls.append(("structured", system, user))
