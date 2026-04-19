@@ -20,7 +20,7 @@ Success = the agent autonomously dials the mock payer, correctly navigates a DTM
 | **Twilio account tier** | **Trial through M4, upgrade at M5** | Correction from prior research: the trial message plays on BOTH outbound AND inbound trial calls, and it requires a press-any-key human gate to advance. That kills the automated mock-payer plan. For M2–M4 the agent dials the user's SMS-verified personal cell, user role-plays the "payer" and presses the key once per call. At M5 the agent must dial an automated TwiML IVR that cannot press keys — upgrade the account then (~$20 one-time). Single upgraded account hosts both agent and mock-payer numbers (~$2.30/mo for 2 numbers). |
 | **ASR** | **Deepgram Nova-3** (streaming WebSocket) | Sub-300ms, strong VAD/endpointing. Tune `endpointing` and `utterance_end_ms` explicitly in M2 — don't leave defaults. |
 | **TTS** | **Cartesia Sonic-3** | 40ms time-to-first-audio — current industry leader. Critical for barge-in feel. |
-| **LLM (structured extraction)** | **Kimi K2 on Groq** (`moonshotai/kimi-k2-instruct`) | Groq's strict `response_format: json_schema` is only supported on Kimi K2, Llama 4 Maverick, and Llama 4 Scout. Qwen3-32B only supports loose `json_object`, which would force a validate-and-retry wrapper. Kimi K2 binds directly to Pydantic. ~$1/$3 per M tokens. Used ONLY for `extract_benefits`. |
+| **LLM (structured extraction)** | **Llama 4 Scout on Groq** (`meta-llama/llama-4-scout-17b-16e-instruct`) | Groq's strict `response_format: json_schema` is supported on Llama 4 Scout, Llama 4 Maverick, and Kimi K2. Kimi K2 was the first pick but is not available on the free/base Groq tier as of the M1 smoke test. Scout binds directly to Pydantic and is cheaper anyway (~$0.11/$0.34 per M tokens). Used ONLY for `extract_benefits`. |
 | **LLM (clarification / reasoning / IVR fallback)** | **Qwen3-32B on Groq** (`qwen/qwen3-32b`) | $0.29/$0.59 per M tokens, ~535 tok/s, 131k context. Strict schema not needed for free-form reasoning; Qwen3 is plenty. |
 | **LLM (fast intent classifier)** | **Rule-based keyword classifier** for IVR menu detection, with a Qwen3-32B fallback | *Pedagogical split.* The whole point of hybrid architecture is learning where the latency budget goes. Using the same LLM for both would erase the lesson. The three-way split (rules → Qwen3 → Kimi K2) exercises the "different models for different jobs" lesson cleanly. |
 | **Observability** | **Langfuse** (self-hosted, open-source) starting at **M4** (not M5) | The moment any state machine is in the loop, you need trace IDs linking `{call_sid, turn_index, node, llm_call}`. Stdout logs drown you fast. |
@@ -52,7 +52,7 @@ Every external integration needs a defined behavior on failure. No bare `try/exc
 | Twilio Media Streams | WebSocket disconnect mid-call | Pipecat transport close event | Log `call_sid` + last state, mark call `terminated_abnormal`, no retry (call is gone) |
 | Twilio REST `sendDigits` | 4xx / network error | Exception on API call | Retry once with 500ms backoff; if still failing → transition to `FALLBACK` |
 | Deepgram ASR | WebSocket drop mid-utterance | Pipecat `DeepgramSTTService` error frame | Reconnect once automatically; if still failing → `FALLBACK` with logged reason |
-| Groq (Qwen3-32B or Kimi K2) | 429 rate limit | HTTP 429 | Exponential backoff, max 2 retries; on timeout (>4s) → `FALLBACK` |
+| Groq (Qwen3-32B or Llama 4 Scout) | 429 rate limit | HTTP 429 | Exponential backoff, max 2 retries; on timeout (>4s) → `FALLBACK` |
 | Groq | 5xx / timeout | HTTP 5xx or 4s timeout | Fail fast → `FALLBACK` (don't chain retries that compound latency) |
 | Cartesia TTS | First-byte timeout | 2s timeout | No retry (silence is worse than re-ask); log and short-circuit to a fixed "sorry, could you repeat that" fallback line |
 | Mock payer | Number unreachable | Twilio call status `failed`/`busy` | Log and exit; don't retry automatically during development |
@@ -294,8 +294,9 @@ def build_graph(llm: LLMClient, classifier: IVRClassifier) -> StateGraph:
 │   │              │   keyword classifier for IVR  │   │                         │
 │   │              │   Reasoning: Qwen3-32B for    │   │                         │
 │   │              │   clarification + IVR fallback│   │                         │
-│   │              │   Extraction: Kimi K2 (strict │   │                         │
-│   │              │   JSON schema → Benefits)     │   │                         │
+│   │              │   Extraction: Llama 4 Scout   │   │                         │
+│   │              │   (strict JSON schema →       │   │                         │
+│   │              │    Benefits)                  │   │                         │
 │   │              └───────────────────────────────┘   │                         │
 │   │                         │                        │                         │
 │   │   ◄── Cartesia TTS ◄── Response Text ◄───────    │                         │
@@ -323,7 +324,7 @@ def build_graph(llm: LLMClient, classifier: IVRClassifier) -> StateGraph:
 1. Audio streams in over Twilio WebSocket → Pipecat VAD detects speech.
 2. Deepgram transcribes streaming → emits transcript frames.
 3. Frame hits the state machine processor. Fast path: regex/keyword classifier checks for IVR menu patterns. If hit, return the DTMF action immediately.
-4. Reasoning path: call Qwen3-32B with `{current_node, transcript, extracted_so_far}` for clarification / IVR fallback. For the `extract_benefits` node, call Kimi K2 with strict `json_schema` bound to the `Benefits` Pydantic model.
+4. Reasoning path: call Qwen3-32B with `{current_node, transcript, extracted_so_far}` for clarification / IVR fallback. For the `extract_benefits` node, call Llama 4 Scout with strict `json_schema` bound to the `Benefits` Pydantic model.
 5. State machine evaluates output → transitions to next node OR fallback.
 6. Next node produces a response text → Cartesia TTS → streamed back to Twilio.
 7. **Barge-in:** if VAD fires while TTS is playing, Pipecat cancels TTS → ASR picks up the interruption → loop re-enters with "interrupted" state.
@@ -440,7 +441,7 @@ voiceadmin-learn/
 
 - `pipecat-ai` — audio pipeline, VAD, barge-in, Twilio transport, `DeepgramSTTService`, `CartesiaTTSService`, `GroqLLMService`.
 - `langfuse` — observability traces (self-hosted via Docker Compose).
-- `pydantic` — `Benefits` schema bound to Kimi K2 via Groq's strict `response_format: json_schema`.
+- `pydantic` — `Benefits` schema bound to Llama 4 Scout via Groq's strict `response_format: json_schema`.
 - Pipecat [LangGraph examples](https://github.com/pipecat-ai/pipecat/tree/main/examples) if Option C is chosen.
 
 ## Verification
