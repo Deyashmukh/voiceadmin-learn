@@ -241,6 +241,39 @@ async def test_state_is_committed_before_response_published(
         await runner.stop()
 
 
+async def test_silent_handler_does_not_republish_stale_response(
+    patient: PatientInfo, fake_llm: FakeLLMClient, fake_classifier: FakeClassifier
+) -> None:
+    """If a handler omits response_text, the previous turn's text must not carry over.
+
+    LangGraph's TypedDict reducer is replace-per-key, so unless _run_turn resets
+    response_text on each turn, a silent handler would re-emit the prior response.
+    patient_id_handler with outcome='speak' sets no response_text — this test
+    catches the regression.
+    """
+    graph = build_graph(fake_llm, fake_classifier)
+    runner = GraphRunner(graph, _ctx(patient))
+    await runner.start()
+    try:
+        # Turn 1: auth emits the "Calling for member..." response.
+        runner.submit_transcript("ready")
+        first = await asyncio.wait_for(runner.out_queue.get(), timeout=1.0)
+        assert "Alice" in first
+        assert runner.state.get("current_node") == "patient_id"
+
+        # Turn 2: patient_id_handler with speak outcome sets no response_text.
+        # out_queue must remain empty (no republish of turn 1's text).
+        runner.submit_transcript("thank you")
+        await asyncio.sleep(0.1)
+        assert runner.out_queue.empty(), (
+            f"silent handler republished stale response: {runner.out_queue.get_nowait()!r}"
+        )
+        assert runner.state.get("current_node") == "extract_benefits"
+        assert runner.state.get("turn_count") == 2
+    finally:
+        await runner.stop()
+
+
 async def test_ctor_overrides_queue_max_and_recursion_limit(
     patient: PatientInfo, fake_llm: FakeLLMClient, fake_classifier: FakeClassifier
 ) -> None:

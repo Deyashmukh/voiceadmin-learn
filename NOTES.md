@@ -58,3 +58,22 @@ edge reads `state["current_node"]` and routes to exactly one handler node, which
 returns `{"current_node": <next_node>, ...}` and goes straight to `END`. Next
 `ainvoke` re-enters dispatcher, reads the new `current_node`, routes to the next
 handler. Clean 1-to-1 mapping: one user turn → one `ainvoke` → one handler ran.
+
+## 6. TypedDict reducer in LangGraph is replace-per-key, not merge — stale values stick
+
+Found via the M3 REPL drive-through, not by any unit test. `patient_id_handler`
+returns `{"current_node": "extract_benefits"}` — no `response_text`. The previous
+turn (`auth_handler`) had set `response_text="Calling for member..."`. Expected:
+new turn emits nothing. Actual: the runner re-published the auth response, because
+LangGraph merges handler returns into the existing state key-by-key, and any key
+the handler omits keeps its prior value. That's correct LangGraph semantics — the
+error was treating the handler return as the complete turn output.
+
+Fix: `_run_turn` resets `response_text` to `None` in `turn_state` before
+`ainvoke`. Now a silent handler produces no response and the out_queue stays
+empty. Regression locked in by
+`test_silent_handler_does_not_republish_stale_response`.
+
+Meta-lesson: offline unit tests with fake LLMs can miss wire-level composition
+bugs — our fakes returned deterministic responses per turn, so the stale-carry
+never manifested. The REPL check with a real LLM exposed it immediately.

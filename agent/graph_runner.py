@@ -135,7 +135,14 @@ class GraphRunner:
             call_sid=self.call_ctx.call_sid,
             turn_index=self.state.get("turn_count", 0),
         )
-        turn_state: CallState = {**self.state, "transcript": transcript}
+        # Reset response_text so a turn whose handler emits no response doesn't
+        # re-publish last turn's text. LangGraph's TypedDict reducer is
+        # replace-per-key, not merge-per-key, so stale values stick otherwise.
+        turn_state: CallState = {
+            **self.state,
+            "transcript": transcript,
+            "response_text": None,
+        }
         try:
             result = await self.graph.ainvoke(
                 turn_state,
