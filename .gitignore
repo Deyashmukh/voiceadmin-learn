@@ -27,5 +27,8 @@ venv/
 # Claude Code session state
 .claude/
 
+# Git worktrees
+.worktrees/
+
 # Langfuse data (if self-hosted in repo)
 langfuse-data/
