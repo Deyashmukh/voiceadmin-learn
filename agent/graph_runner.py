@@ -9,9 +9,12 @@ aborts and the handler's `await` raises `CancelledError`.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
+from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 
@@ -39,10 +42,12 @@ class GraphRunner:
         *,
         queue_max: int = QUEUE_MAX,
         recursion_limit: int = RECURSION_LIMIT,
+        callbacks: Sequence[Any] | None = None,
     ) -> None:
         self.graph = graph
         self.call_ctx = call_ctx
         self.recursion_limit = recursion_limit
+        self.callbacks = list(callbacks) if callbacks else []
         self.in_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_max)
         self.out_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_max)
         self.state: CallState = initial_state(call_ctx.patient)
@@ -143,11 +148,17 @@ class GraphRunner:
             "transcript": transcript,
             "response_text": None,
         }
+        config: RunnableConfig = {
+            "recursion_limit": self.recursion_limit,
+            "metadata": {
+                "call_sid": self.call_ctx.call_sid,
+                "turn_index": self.state.get("turn_count", 0),
+            },
+        }
+        if self.callbacks:
+            config["callbacks"] = self.callbacks
         try:
-            result = await self.graph.ainvoke(
-                turn_state,
-                config={"recursion_limit": self.recursion_limit},
-            )
+            result = await self.graph.ainvoke(turn_state, config=config)
         except GraphRecursionError:
             log.warning("graph_recursion_limit")
             return self._hard_fallback("recursion_limit")

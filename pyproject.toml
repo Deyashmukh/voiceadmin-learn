@@ -9,6 +9,8 @@ dependencies = [
     "deepgram-sdk==6.1.1",
     "fastapi==0.136.0",
     "groq==1.1.2",
+    "langchain==1.2.15",
+    "langfuse==4.5.0",
     "langgraph==1.1.6",
     "pipecat-ai==1.0.0",
     "pydantic-settings==2.13.1",
