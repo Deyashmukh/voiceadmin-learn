@@ -295,5 +295,30 @@ async def test_frames_forwarded_downstream(
     assert "EndFrame" in types
 
 
+async def test_barge_in_drains_queued_response(
+    patient: PatientInfo, fake_llm: FakeLLMClient, fake_classifier: FakeClassifier
+) -> None:
+    """A response that completed just before the user started speaking must not play.
+
+    The race: turn N finishes and puts its response on out_queue. Before the
+    pump drains it, VAD fires. The queued text must be discarded — otherwise
+    the barge-in is cosmetic and the stale response still hits TTS.
+    """
+    proc, runner, sink = await _make_processor(patient, fake_llm, fake_classifier)
+    try:
+        # Seed a stale response directly onto the queue, bypassing a real turn.
+        runner.out_queue.put_nowait("stale response")
+        assert runner.out_queue.qsize() == 1
+        # User starts speaking.
+        await proc.process_frame(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        # Queue drained immediately (drain is synchronous in mark_interrupted).
+        assert runner.out_queue.empty()
+        # Give the pump a chance to run — it must not have seen the stale text.
+        await asyncio.sleep(0.05)
+        assert not _text_frames(sink)
+    finally:
+        await _shutdown(proc)
+
+
 # Silence the unused-import warning if pytest-asyncio's autouse changes.
 pytestmark = pytest.mark.asyncio

@@ -57,6 +57,17 @@ class GraphRunner:
 
     async def start(self) -> None:
         self._consumer = asyncio.create_task(self._consume(), name="graph-runner-consume")
+        self._consumer.add_done_callback(self._on_consumer_done)
+
+    @staticmethod
+    def _on_consumer_done(task: asyncio.Task[None]) -> None:
+        # If the consumer dies with an unhandled exception, the pump keeps awaiting
+        # out_queue forever. Surface it so the failure isn't silent.
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("consumer_task_died", error=str(exc))
 
     async def stop(self) -> None:
         if self._current_turn and not self._current_turn.done():
@@ -87,6 +98,14 @@ class GraphRunner:
 
     def mark_interrupted(self) -> None:
         """Cancel the in-flight turn. Must be called from the event-loop thread."""
+        # Drop any queued-but-not-yet-spoken response. A turn that completed
+        # moments before the user started speaking will otherwise still be
+        # spoken after the barge-in — defeats the whole point.
+        while not self.out_queue.empty():
+            try:
+                self.out_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         # Only set the flag when there's a real turn to cancel. Setting it
         # between turns would leave it stuck True and conflate a future
         # stop() cancellation with an interrupt.

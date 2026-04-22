@@ -77,4 +77,12 @@ class StateMachineProcessor(FrameProcessor):
     async def _pump_output(self) -> None:
         while True:
             response = await self._runner.out_queue.get()
-            await self.push_frame(TextFrame(text=response), FrameDirection.DOWNSTREAM)
+            try:
+                await self.push_frame(TextFrame(text=response), FrameDirection.DOWNSTREAM)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # If downstream tears down before _stop() runs, push_frame can
+                # raise. Log and keep consuming so the runner isn't back-pressured
+                # on a full out_queue forever.
+                log.warning("pump_push_failed", error=str(exc))
