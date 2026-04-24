@@ -1,8 +1,8 @@
 """M3 exit bar: REPL drive-through with a real Groq-backed LLMClient.
 
-Builds the LangGraph state machine with a real `meta-llama/llama-4-scout`
-Groq client (structured JSON) and a stub classifier, then drives it turn-by-turn
-through the happy path: auth -> patient_id -> extract_benefits -> handoff -> done.
+Builds the LangGraph state machine with the production `GroqLLMClient` and the
+rule-based classifier, then drives it turn-by-turn through the happy path:
+auth -> patient_id -> extract_benefits -> handoff -> done.
 
 Run: `uv run python scripts/m3_repl_check.py`
 Requires: .env with GROQ_API_KEY.
@@ -14,20 +14,17 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any
 
 from dotenv import load_dotenv
-from groq import Groq
-from pydantic import BaseModel
 
+from agent.classifier import RuleBasedClassifier
 from agent.graph import build_graph
 from agent.graph_runner import CallContext, GraphRunner
-from agent.schemas import Benefits, ClassifierResult, PatientInfo
+from agent.llm_client import GroqLLMClient
+from agent.schemas import Benefits, PatientInfo
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env", override=True)
-
-EXTRACTION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 REP_UTTERANCE = (
     "Yes, the member is active. Deductible remaining is $250. Copay is $30. "
@@ -35,68 +32,14 @@ REP_UTTERANCE = (
 )
 
 
-class GroqLLMClient:
-    """Minimal real LLMClient for the REPL check. M4 owns the production one."""
-
-    def __init__(self, api_key: str) -> None:
-        self._client = Groq(api_key=api_key)
-
-    async def complete_free_form(self, system: str, user: str) -> str:
-        def _call() -> str:
-            r = self._client.chat.completions.create(
-                model=EXTRACTION_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                max_tokens=200,
-            )
-            return (r.choices[0].message.content or "").strip()
-
-        return await asyncio.to_thread(_call)
-
-    async def complete_structured[T: BaseModel](self, system: str, user: str, schema: type[T]) -> T:
-        # Spell out the exact field names; otherwise Llama happily invents
-        # synonyms (e.g. "is_active" instead of "active") and pydantic rejects.
-        schema_json: dict[str, Any] = schema.model_json_schema()
-
-        def _call() -> T:
-            r = self._client.chat.completions.create(
-                model=EXTRACTION_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            f"{system}\nRespond with ONLY a single JSON object that matches "
-                            f"this JSON schema exactly (use the exact field names):\n"
-                            f"{json.dumps(schema_json)}"
-                        ),
-                    },
-                    {"role": "user", "content": user},
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=300,
-            )
-            payload = r.choices[0].message.content or "{}"
-            return schema.model_validate_json(payload)
-
-        return await asyncio.to_thread(_call)
-
-
-class StubClassifier:
-    def classify(self, transcript: str) -> ClassifierResult:
-        return ClassifierResult(outcome="speak", confidence=1.0)
-
-
 async def main() -> None:
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
+    if not os.environ.get("GROQ_API_KEY"):
         raise SystemExit("GROQ_API_KEY not set in environment")
 
     patient = PatientInfo(
         member_id="M123456", first_name="Alice", last_name="Example", dob="1980-05-12"
     )
-    graph = build_graph(GroqLLMClient(api_key), StubClassifier())
+    graph = build_graph(GroqLLMClient(), RuleBasedClassifier())
     runner = GraphRunner(graph, CallContext(call_sid="REPL", patient=patient))
     await runner.start()
 

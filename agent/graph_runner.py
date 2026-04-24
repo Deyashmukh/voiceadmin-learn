@@ -9,9 +9,12 @@ aborts and the handler's `await` raises `CancelledError`.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
+from langchain_core.runnables import RunnableConfig
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 
@@ -39,10 +42,12 @@ class GraphRunner:
         *,
         queue_max: int = QUEUE_MAX,
         recursion_limit: int = RECURSION_LIMIT,
+        callbacks: Sequence[Any] | None = None,
     ) -> None:
         self.graph = graph
         self.call_ctx = call_ctx
         self.recursion_limit = recursion_limit
+        self.callbacks = list(callbacks) if callbacks else []
         self.in_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_max)
         self.out_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_max)
         self.state: CallState = initial_state(call_ctx.patient)
@@ -52,6 +57,17 @@ class GraphRunner:
 
     async def start(self) -> None:
         self._consumer = asyncio.create_task(self._consume(), name="graph-runner-consume")
+        self._consumer.add_done_callback(self._on_consumer_done)
+
+    @staticmethod
+    def _on_consumer_done(task: asyncio.Task[None]) -> None:
+        # If the consumer dies with an unhandled exception, the pump keeps awaiting
+        # out_queue forever. Surface it so the failure isn't silent.
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("consumer_task_died", error=str(exc))
 
     async def stop(self) -> None:
         if self._current_turn and not self._current_turn.done():
@@ -82,6 +98,14 @@ class GraphRunner:
 
     def mark_interrupted(self) -> None:
         """Cancel the in-flight turn. Must be called from the event-loop thread."""
+        # Drop any queued-but-not-yet-spoken response. A turn that completed
+        # moments before the user started speaking will otherwise still be
+        # spoken after the barge-in — defeats the whole point.
+        while not self.out_queue.empty():
+            try:
+                self.out_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         # Only set the flag when there's a real turn to cancel. Setting it
         # between turns would leave it stuck True and conflate a future
         # stop() cancellation with an interrupt.
@@ -143,11 +167,17 @@ class GraphRunner:
             "transcript": transcript,
             "response_text": None,
         }
+        config: RunnableConfig = {
+            "recursion_limit": self.recursion_limit,
+            "metadata": {
+                "call_sid": self.call_ctx.call_sid,
+                "turn_index": self.state.get("turn_count", 0),
+            },
+        }
+        if self.callbacks:
+            config["callbacks"] = self.callbacks
         try:
-            result = await self.graph.ainvoke(
-                turn_state,
-                config={"recursion_limit": self.recursion_limit},
-            )
+            result = await self.graph.ainvoke(turn_state, config=config)
         except GraphRecursionError:
             log.warning("graph_recursion_limit")
             return self._hard_fallback("recursion_limit")
