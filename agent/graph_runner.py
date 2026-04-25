@@ -167,11 +167,21 @@ class GraphRunner:
             "transcript": transcript,
             "response_text": None,
         }
+        turn_index = self.state.get("turn_count", 0)
+        # `langfuse_session_id` groups all turns of one call into a single Langfuse
+        # session in the UI; without it, each turn lands as an orphan trace. The
+        # plain `call_sid`/`turn_index` keys stay too — useful for grep over JSON
+        # logs and for callers that aren't reading Langfuse-reserved metadata.
         config: RunnableConfig = {
             "recursion_limit": self.recursion_limit,
+            "run_name": f"turn-{turn_index}",
+            "tags": ["voiceadmin", "eligibility"],
             "metadata": {
                 "call_sid": self.call_ctx.call_sid,
-                "turn_index": self.state.get("turn_count", 0),
+                "turn_index": turn_index,
+                "langfuse_session_id": self.call_ctx.call_sid,
+                "langfuse_user_id": self.call_ctx.patient.member_id,
+                "langfuse_tags": ["voiceadmin", "eligibility"],
             },
         }
         if self.callbacks:
