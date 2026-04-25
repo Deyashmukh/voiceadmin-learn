@@ -5,7 +5,6 @@ config:
 ---
 graph TD;
 	__start__([<p>__start__</p>]):::first
-	dispatcher(dispatcher)
 	auth(auth)
 	patient_id(patient_id)
 	extract_benefits(extract_benefits)
@@ -13,13 +12,12 @@ graph TD;
 	fallback(fallback)
 	done(done)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> dispatcher;
-	dispatcher -.-> auth;
-	dispatcher -.-> done;
-	dispatcher -.-> extract_benefits;
-	dispatcher -.-> fallback;
-	dispatcher -.-> handoff;
-	dispatcher -.-> patient_id;
+	__start__ -.-> auth;
+	__start__ -.-> done;
+	__start__ -.-> extract_benefits;
+	__start__ -.-> fallback;
+	__start__ -.-> handoff;
+	__start__ -.-> patient_id;
 	auth --> __end__;
 	done --> __end__;
 	extract_benefits --> __end__;

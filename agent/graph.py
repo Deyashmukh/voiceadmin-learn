@@ -1,18 +1,19 @@
 """LangGraph state machine for the eligibility-verification call.
 
-One `ainvoke` = one turn. A dispatcher node reads `current_node` and routes
-to the handler for that node. Each handler returns a partial state with the
-next `current_node`, then goes to END. The next turn re-enters dispatcher.
+One `ainvoke` = one turn. Conditional edges from START route directly to the
+handler for `state["current_node"]`. Each handler returns a partial state with
+the next `current_node`, then goes to END. The next turn re-enters from START.
 
 Handlers are built as closures over injected dependencies so they stay
-unit-testable with fakes (no pipecat / twilio imports here).
+unit-testable with fakes (no pipecat / twilio imports here). Handlers must be
+idempotent and cancellation-safe; errors return `_to_fallback`, never partial state.
 """
 
 from __future__ import annotations
 
 import json
 
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
@@ -49,16 +50,13 @@ def _to_fallback(reason: str, response: str = FALLBACK_RESPONSE) -> CallState:
     }
 
 
-def _route_from_dispatcher(state: CallState) -> str:
+def _route_from_start(state: CallState) -> str:
+    """Route the turn to the handler matching `state['current_node']`."""
     node = state.get("current_node", "fallback")
     if node not in NODES:
         log.warning("unknown_node_routed_to_fallback", node=node)
         return "fallback"
     return node
-
-
-def _dispatcher(state: CallState) -> CallState:
-    return {}
 
 
 def build_graph(llm: LLMClient, classifier: IVRClassifier) -> CompiledStateGraph:
@@ -136,7 +134,6 @@ def build_graph(llm: LLMClient, classifier: IVRClassifier) -> CompiledStateGraph
         return {"current_node": "done"}
 
     builder = StateGraph(CallState)
-    builder.add_node("dispatcher", _dispatcher)
     builder.add_node("auth", auth_handler)
     builder.add_node("patient_id", patient_id_handler)
     builder.add_node("extract_benefits", extract_benefits_handler)
@@ -144,13 +141,13 @@ def build_graph(llm: LLMClient, classifier: IVRClassifier) -> CompiledStateGraph
     builder.add_node("fallback", fallback_handler)
     builder.add_node("done", done_handler)
 
-    builder.set_entry_point("dispatcher")
     builder.add_conditional_edges(
-        "dispatcher",
-        _route_from_dispatcher,
+        START,
+        _route_from_start,
         {n: n for n in NODES},
     )
     for n in NODES:
         builder.add_edge(n, END)
 
+    # No checkpointer: per-call state lives in GraphRunner; revisit if resume-after-crash matters.
     return builder.compile()

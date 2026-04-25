@@ -14,16 +14,20 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.runnables import RunnableConfig
-from langgraph.errors import GraphRecursionError
+from langgraph.errors import GraphRecursionError, InvalidUpdateError
 from langgraph.graph.state import CompiledStateGraph
 
 from agent.graph import initial_state
 from agent.logging_config import log
+from agent.observability import flush_langfuse
 from agent.schemas import FALLBACK_RESPONSE, CallState, PatientInfo
 
 QUEUE_MAX = 8
+# Healthy turn = 1-2 supersteps; >10 means a handler is looping itself.
 RECURSION_LIMIT = 10
+TURN_TAGS: tuple[str, ...] = ("voiceadmin", "eligibility")
 
 
 @dataclass
@@ -42,7 +46,7 @@ class GraphRunner:
         *,
         queue_max: int = QUEUE_MAX,
         recursion_limit: int = RECURSION_LIMIT,
-        callbacks: Sequence[Any] | None = None,
+        callbacks: Sequence[BaseCallbackHandler] | None = None,
     ) -> None:
         self.graph = graph
         self.call_ctx = call_ctx
@@ -54,6 +58,12 @@ class GraphRunner:
         self._consumer: asyncio.Task[None] | None = None
         self._current_turn: asyncio.Task[CallState] | None = None
         self._interrupt_requested: bool = False
+        # Call-constant metadata; only `turn_index` / `run_name` change per turn.
+        self._base_metadata: dict[str, Any] = {
+            "langfuse_session_id": call_ctx.call_sid,
+            "langfuse_user_id": call_ctx.patient.member_id,
+            "langfuse_tags": list(TURN_TAGS),
+        }
 
     async def start(self) -> None:
         self._consumer = asyncio.create_task(self._consume(), name="graph-runner-consume")
@@ -84,6 +94,9 @@ class GraphRunner:
             except Exception as exc:  # noqa: BLE001
                 # A task that crashed during shutdown is still a real bug — don't silently swallow.
                 log.warning("task_error_during_stop", task=task.get_name(), error=str(exc))
+        # Drain Langfuse's batch buffer before transport-disconnect tears the
+        # process down, otherwise the last few spans of the call never land.
+        await flush_langfuse()
 
     def submit_transcript(self, text: str) -> None:
         """Non-blocking enqueue with drop-oldest on full. Callable from Pipecat."""
@@ -167,20 +180,27 @@ class GraphRunner:
             "transcript": transcript,
             "response_text": None,
         }
+        turn_index = self.state.get("turn_count", 0)
+        # `langfuse_session_id` groups all turns of one call into one Langfuse session.
         config: RunnableConfig = {
             "recursion_limit": self.recursion_limit,
-            "metadata": {
-                "call_sid": self.call_ctx.call_sid,
-                "turn_index": self.state.get("turn_count", 0),
-            },
+            "run_name": f"turn-{turn_index}",
+            "tags": list(TURN_TAGS),
+            "metadata": {**self._base_metadata, "turn_index": turn_index},
         }
         if self.callbacks:
             config["callbacks"] = self.callbacks
+        # `ainvoke` (not `astream_events`): TTS handles streaming downstream;
+        # per-turn we only need the final state + response_text.
         try:
             result = await self.graph.ainvoke(turn_state, config=config)
         except GraphRecursionError:
             log.warning("graph_recursion_limit")
             return self._hard_fallback("recursion_limit")
+        except InvalidUpdateError as exc:
+            # Reducer-contract violation = graph-construction bug, not runtime data.
+            log.exception("graph_invalid_update", error=str(exc))
+            return self._hard_fallback("graph_invalid_update")
         except Exception as exc:  # noqa: BLE001
             # Scope this to the graph invocation only. If _hard_fallback
             # itself raises (a real bug), we want the exception to propagate
