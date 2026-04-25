@@ -223,6 +223,44 @@ def build_graph(llm: LLMClient, classifier: IVRClassifier) -> CompiledGraph:
 
 **Handlers MUST be cancellation-safe.** If `CancelledError` is raised mid-handler (because the user interrupted), the handler must not write partial state to a shared store. Since handlers return dicts rather than mutating inputs, this is mostly automatic — but any external side effect (logging a partial write, sending a webhook) must be inside a `try/finally` that cleans up on cancel.
 
+### Final-system routing (post-M7)
+
+The simple `auth → patient_id → extract_benefits → handoff → done` chain above is the M3/M4 skeleton. The post-M7 graph replaces it with the shape below, recorded here for M5–M7 to land against.
+
+**Four-mode routing — every turn re-classifies.** The IVR-vs-human decision is not made once and locked in. Each turn the conditional edges from `START` re-evaluate `current_node`, and any handler can pivot the call into a different mode at the next turn boundary.
+
+| Mode (`current_node`) | What this turn does | Pivots allowed next turn |
+|---|---|---|
+| `ivr_nav` | Rule-heavy classifier reads the IVR prompt; decides DTMF, or detects handoff / benefits-stream | → `ivr_nav`, → `ivr_extract`, → `rep_wait`, → `fallback` |
+| `ivr_extract` (subgraph) | Regex parsers fill `Benefits` fields; zero LLM calls on this path | → `ivr_extract`, → `rep_wait`, → `done`, → `fallback` |
+| `rep_wait` | Listens for a human greeting | → `rep_turn`, → `rep_wait`, → `fallback` |
+| `rep_turn` (LLM) | One LLM call owns the whole human conversation this turn | → `rep_turn`, → `done`, → `fallback` |
+
+`ivr_extract` is a **router subgraph, not just a parser.** Inside it, regex `parse_*` nodes (active, deductible, copay, coinsurance, OON) run in parallel within a single superstep alongside a `detect_segment` node that scans for handoff phrases (*"representative"*, *"transferring"*, *"please hold"*) and call-end phrases (*"thank you for calling"*). A terminal `merge_and_route` node combines parsed fields into `state.extracted` and decides where the next outer turn enters: stay in `ivr_extract` (more benefits coming), exit to `rep_wait` (payer pivoted mid-stream), or `done` (call closing). On a regex miss with no matched fields, exit to `fallback` with reason `ivr_regex_miss`. No silent LLM fallback — pure-IVR is zero LLM by contract.
+
+`rep_turn` **replaces `extract_benefits` + `clarify`** for the human phase. The LLM owns everything spoken to the rep: intro, extraction, follow-up questions, clarification of ambiguous answers, polite engagement with small talk, empathetic acknowledgment of difficult topics, closing. One `llm.complete_structured(schema=RepTurnOutput)` call per rep utterance:
+
+```python
+class RepTurnOutput(BaseModel):
+    reply: str                    # what the agent says aloud ("" = stay silent)
+    extracted: Benefits           # fields learned from THIS utterance only; others None
+    phase: Literal["extracting", "complete", "stuck"]
+    reasoning: str | None = None  # optional, for Langfuse traces
+```
+
+The handler merges `extracted` into `state.extracted` (non-None wins; conflicts surface naturally on the next turn as the LLM's own follow-up question) and appends both the rep transcript and the agent reply to a `conversation: list[Turn]` field on `CallState`. The LLM receives the running history each turn — no separate `clarify` node, no template acknowledgment pools, no banned-phrase lint.
+
+**Persona** (lives in `agent/prompts/rep_turn.v1.txt`):
+
+> You are Morgan, a staff member at a provider's office calling an insurance rep to verify eligibility benefits for {patient}. You are a real person on a real phone call — not a robot, no script. If the rep makes small talk, engage briefly. If they say something difficult, acknowledge with warmth before continuing. Never announce your own intent (*"I need to..."*, *"Let me get back to..."*). When all required fields in `Benefits` are confidently filled, set `phase: "complete"`. When the rep has been asked the same field twice without a usable answer, set `phase: "stuck"`.
+
+**Hybrid principle.** Deterministic path stays deterministic; probabilistic path stays probabilistic. No template-and-LLM mixing inside any single phase. Pure IVR = zero LLM. Human conversation = LLM owns every word the agent speaks. This maps the project's pedagogical lesson directly onto the call's actual two modes.
+
+**Known limitations** (acceptable for the learning project, flagged for any future production version):
+
+- **No human → IVR reversal.** If a rep puts the agent on hold and an IVR comes back, the current graph has no edge `rep_turn → ivr_nav`. ASR keeps flowing into whichever node is current. Add an edge if this becomes a real scenario.
+- **Hallucination guardrail is prompt-only.** The LLM might over- or under-extract from a rep utterance. For production, add a verifier pass over the transcript; for this project, accept and log.
+
 ### Interrupt re-entry
 
 Interrupts are **real task cancellations**, not flag checks:
@@ -341,20 +379,22 @@ voiceadmin-learn/
 ├── .pre-commit-config.yaml           # ruff + pyright
 ├── agent/
 │   ├── main.py                       # Pipecat pipeline + entrypoint
-│   ├── graph.py                      # LangGraph StateGraph definition + handlers + Protocols
+│   ├── graph.py                      # LangGraph StateGraph: ivr_nav, rep_wait, rep_turn, fallback, done
 │   ├── graph_runner.py                # Async task that owns the graph + in/out queues
-│   ├── classifier.py                 # Rule-based IVR keyword classifier
+│   ├── ivr_extract.py                # Subgraph: parallel regex parse_* + detect_segment + merge_and_route (M6)
+│   ├── classifier.py                 # Rule-heavy ivr_nav decision tree (menus, data entry, transitions, confirmations)
 │   ├── llm_client.py                 # Groq-backed LLMClient implementation
+│   ├── observability.py              # Langfuse callbacks, flush_langfuse, enrich_current_generation
 │   ├── processors/
 │   │   └── state_processor.py        # Thin Pipecat FrameProcessor: queues frames to/from graph_runner
 │   ├── telephony/
 │   │   ├── dialer.py                 # Outbound dial + ALLOWED_DESTINATIONS check
 │   │   └── dtmf.py                   # Twilio sendDigits helper
 │   ├── prompts/
-│   │   └── benefits_extractor.v1.txt # versioned; v2 for M7 experiments
+│   │   └── rep_turn.v1.txt           # Persona prompt for the LLM-owned human phase (M6); v2 for M7c experiments
 │   ├── logging_config.py             # structlog setup, call_sid/turn_index contextvars
 │   ├── config.py                     # typed settings loaded from .env
-│   └── schemas.py                    # Pydantic: PatientInfo, Benefits, CallState
+│   └── schemas.py                    # Pydantic: PatientInfo, Benefits, CallState, RepTurnOutput, Turn
 ├── mock_payer/
 │   ├── main.py                       # FastAPI + TwiML webhooks
 │   └── ivr_tree.py                   # Deterministic TwiML <Gather> tree
@@ -413,29 +453,30 @@ voiceadmin-learn/
    - Add Langfuse via LangGraph's native tracing integration (env var + callback handler). Verify trace tree shows node transitions and LLM calls.
    - Call the agent from your cell phone, manually role-play the payer IVR. Verify node transitions in Langfuse.
 
-5. **M5 — Upgrade Twilio, DTMF spike, then mock payer (IVR leg).**
+5. **M5 — Upgrade Twilio, DTMF spike, mock payer IVR, and the rule-heavy `ivr_nav` classifier.**
    - **Upgrade first** (~$20 one-time deposit). Automated IVR requires no trial-message gate, which only an upgraded account provides. Buy a second number on the upgraded account for the mock payer (~$1.15/mo). Update `TWILIO_PAYER_NUMBER` and add it to `ALLOWED_DESTINATIONS`.
    - **DTMF spike:** verify mid-stream DTMF injection actually works. Place a test call into Media Streams, call `sendDigits` on the call SID, confirm the remote side receives DTMF. **Do not build the IVR tree until this works.**
-   - Then build mock payer: FastAPI + TwiML `<Gather>` tree. Simple and deterministic.
-   - Agent dials mock payer. Happy path: blast through IVR, reach "rep handoff" state.
+   - Build the mock payer: FastAPI + TwiML `<Gather>` tree. Simple and deterministic.
+   - Build out `agent/classifier.py` from the M4 stub into the real **`ivr_nav` decision tree.** Four prompt shapes to cover: (a) menu prompts (parse options, intent-match, return DTMF), (b) data-entry prompts (read `state.patient.*`, return as DTMF + `#`), (c) routing/transition prompts (*"connecting you to a representative"* → set `current_node="rep_wait"`; *"your benefits are..."* → set `current_node="ivr_extract"`), (d) confirmations / echoes (*"you entered 123, press 1 to confirm"* → return `1`). Plain `if/elif` over regex tables — this is where deterministic logic earns its keep.
+   - End state: agent autonomously navigates the IVR tree. Happy path: blast through DTMF, reach the rep-handoff prompt.
 
-6. **M6 — Mock payer (scripted human rep leg).**
-   - `<Say>` out a fixed rep dialogue after IVR handoff. Scripted, not an LLM.
-   - Agent extracts benefits JSON from the scripted conversation.
-   - End-to-end happy path should now work.
+6. **M6 — `ivr_extract` subgraph (zero-LLM) and `rep_turn` (LLM-owned human phase).**
+   - **`ivr_extract` subgraph** (`agent/ivr_extract.py`): parallel regex `parse_*` nodes for the five `Benefits` fields, plus a `detect_segment` node for handoff/end-call phrases, plus a terminal `merge_and_route` node. Word-to-number conversion via `word2number` for spelled numerals. Regex miss → outer `fallback` with reason `ivr_regex_miss`. Required for the pure-IVR call path; zero LLM calls on this path.
+   - **`rep_turn` node** (`agent/graph.py`): one `llm.complete_structured(schema=RepTurnOutput)` per rep utterance. Conversation history (`list[Turn]` on `CallState`) appended each turn and re-rendered into the prompt. Persona prompt in `agent/prompts/rep_turn.v1.txt`. Merge policy in the handler: non-None wins, conflicts surface as the LLM's own follow-up next turn.
+   - **Mock rep**: `<Say>` out a fixed scripted rep dialogue after IVR handoff. Scripted, not an LLM (yet). The agent's side is fully LLM-driven; the rep's side stays deterministic so we're not debugging two LLMs at once.
+   - End-to-end happy path on a mixed IVR → human call should land structured `Benefits` JSON.
+   - Verification: 5/5 happy-path runs land complete `Benefits`. Per-call total token budget under 25k on Qwen3-32B (~1¢/call on Groq).
 
 7. **M7a — Barge-in re-entry.**
-   - Mock rep interrupts agent mid-sentence.
-   - Assert agent stops, listens, re-enters the state machine cleanly.
+   - Mock rep interrupts agent mid-sentence. Assert agent stops, listens, re-enters cleanly. Already covered by M4's `mark_interrupted` — M7a is the live-call verification.
 
-8. **M7b — Adaptive IVR (LLM fallback path).**
-   - Mock IVR swaps prompt order. Rule-based classifier misses. Qwen3-32B fallback fires, extracts correct action.
-   - This is the milestone that exercises the hybrid architecture lesson.
+8. **M7b — Adaptive IVR (LLM fallback inside `ivr_nav`).**
+   - Mock IVR swaps prompt order or rephrasing. The rule-based decision tree returns `unknown`. `ivr_nav` falls through to one Qwen3-32B `complete_structured(schema=IVRAction)` call to recover. This is the milestone that exercises the hybrid architecture lesson directly: deterministic when it works, probabilistic when it doesn't.
 
-9. **M7c — Ambiguous rep answer (CLARIFICATION path).**
-   - Upgrade mock rep to a Pipecat+LLM persona with a quirks toggle. Rep gives ambiguous answer.
-   - Agent asks clarifying question, gets structured answer, continues.
-   - Only do this if M6 runs cleanly — otherwise cut.
+9. **M7c — Rep-side deviation: small talk, ambiguity, emotional content.**
+   - Upgrade mock rep to a Pipecat+LLM persona with a quirks toggle. Three deviations to test: (a) small talk (rep mentions weather mid-conversation — agent engages briefly without losing thread), (b) ambiguous answer (rep hedges — agent's next turn naturally produces a clarifying question with no separate node), (c) emotional content (rep mentions something difficult — agent acknowledges warmly with `reply` only, no extraction that turn).
+   - These exercise the rule that everything spoken to the rep flows through `rep_turn`'s LLM. There is no template-driven deflection, no banned-phrase lint, no separate clarify node — it's all prompt + persona.
+   - Only attempt if M6 runs cleanly. Otherwise cut.
 
 ## Reused / referenced libraries
 
@@ -459,8 +500,11 @@ voiceadmin-learn/
 
 - **Accounts:** Deepgram exists. M1 includes signup for Twilio (pay-as-you-go, ~$20), Cartesia, Groq.
 - **Repo layout:** Single repo, `agent/` and `mock_payer/` subfolders.
-- **Observability:** Langfuse, pulled forward from M5 → **M4**.
+- **Observability:** Langfuse, pulled forward from M5 → **M4**. Considered LangSmith during M4 audit; rejected to avoid migration churn. The G1/G2 fixes (Groq `@observe`, `langfuse_session_id`) would be the same shape on either tool.
 - **State machine framework:** **LangGraph** — industry-standard library. Runs *alongside* Pipecat via queues, never inside a FrameProcessor's `process_frame()`. User will dig into LangGraph internals whenever something is opaque.
+- **Hybrid principle:** deterministic path stays deterministic, probabilistic path stays probabilistic. Pure-IVR extraction (`ivr_extract`) uses zero LLM calls (regex over standard payer TTS phrasing). Human conversation (`rep_turn`) is fully LLM-owned — every word the agent speaks during the rep phase comes from one structured-output LLM call per turn. No template-and-LLM mixing inside any single phase.
+- **Persona for human phase:** the agent plays a provider-side rep ("Morgan, staff at a provider's office") calling the payer to verify benefits — not a payer rep. The persona prompt forbids announcing intent ("I need to..."), expects brief engagement with small talk, and routes empathy through the same single LLM call rather than a separate path.
+- **Routing flexibility:** the IVR-vs-human decision re-evaluates every turn. Any handler can pivot the call to a different mode at the next turn boundary (e.g., mid-`ivr_extract` handoff to `rep_wait` if the payer transfers to a human while reading benefits).
 - **Budget:** $25–$40 approved.
 
 ## Execution rules (enforced during build)
