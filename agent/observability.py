@@ -37,12 +37,7 @@ def langfuse_callbacks() -> list[Any]:
 
 
 def flush_langfuse() -> None:
-    """Flush pending Langfuse events. Safe to call when Langfuse is disabled.
-
-    Langfuse batches spans and flushes on a timer; if the process tears down
-    between turns we lose the tail. `GraphRunner.stop()` calls this on every
-    transport-disconnect so per-call traces always land.
-    """
+    """Drain Langfuse's batch buffer so the tail of a call doesn't get lost on shutdown."""
     if not _langfuse_enabled():
         return
     try:
@@ -51,3 +46,16 @@ def flush_langfuse() -> None:
         get_client().flush()
     except Exception as exc:  # noqa: BLE001
         log.warning("langfuse_flush_failed", error=str(exc))
+
+
+def enrich_current_generation(*, model: str, usage: dict[str, Any] | None) -> None:
+    """Attach model name and token usage to the active Langfuse generation span.
+
+    No-op when Langfuse is disabled — the stub client swallows the call.
+    """
+    try:
+        from langfuse import get_client
+
+        get_client().update_current_generation(model=model, usage_details=usage)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("langfuse_enrich_failed", error=str(exc))

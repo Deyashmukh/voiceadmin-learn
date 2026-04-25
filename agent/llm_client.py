@@ -3,11 +3,8 @@
 Kept in `agent/` (not `scripts/`) so both `main.py` and the M3 REPL drive-through
 (`scripts/m3_repl_check.py`) import it instead of duplicating.
 
-Both methods are decorated with `@observe(as_type="generation")` so Langfuse
-captures them as LLM generations in the trace. The raw `groq` SDK doesn't go
-through `langchain_core`, so the LangGraph callback handler can't see these
-calls — without `@observe` they'd be invisible in the Langfuse UI. The decorator
-is a no-op when Langfuse env vars aren't set, so this stays safe offline.
+`@observe` makes the raw Groq calls visible to Langfuse — they bypass
+`langchain_core`, so the LangGraph callback handler alone can't see them.
 """
 
 from __future__ import annotations
@@ -18,10 +15,11 @@ import os
 from typing import Any
 
 from groq import Groq
-from langfuse import get_client, observe
+from langfuse import observe
 from pydantic import BaseModel
 
 from agent.logging_config import log
+from agent.observability import enrich_current_generation
 
 EXTRACTION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 FREE_FORM_MODEL = "qwen/qwen3-32b"
@@ -50,7 +48,7 @@ class GroqLLMClient:
             return (r.choices[0].message.content or "", _usage(r))
 
         text, usage = await asyncio.to_thread(_call)
-        _enrich_generation(model=FREE_FORM_MODEL, usage=usage)
+        enrich_current_generation(model=FREE_FORM_MODEL, usage=usage)
         return text
 
     @observe(as_type="generation", name="groq.complete_structured")
@@ -78,12 +76,11 @@ class GroqLLMClient:
 
         raw, usage = await asyncio.to_thread(_call)
         log.debug("groq_structured_raw", raw=raw)
-        _enrich_generation(model=EXTRACTION_MODEL, usage=usage)
+        enrich_current_generation(model=EXTRACTION_MODEL, usage=usage)
         return schema.model_validate_json(raw)
 
 
 def _usage(response: Any) -> dict[str, Any] | None:
-    """Pull token counts off a Groq chat completion response, if present."""
     u = getattr(response, "usage", None)
     if u is None:
         return None
@@ -92,15 +89,3 @@ def _usage(response: Any) -> dict[str, Any] | None:
         "output": getattr(u, "completion_tokens", None),
         "total": getattr(u, "total_tokens", None),
     }
-
-
-def _enrich_generation(*, model: str, usage: dict[str, Any] | None) -> None:
-    """Attach model name and token usage to the active Langfuse generation span.
-
-    No-op when Langfuse is disabled — `get_client()` returns a stub client whose
-    `update_current_generation` swallows the call.
-    """
-    try:
-        get_client().update_current_generation(model=model, usage_details=usage)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("langfuse_enrich_failed", error=str(exc))

@@ -5,18 +5,8 @@ handler for `state["current_node"]`. Each handler returns a partial state with
 the next `current_node`, then goes to END. The next turn re-enters from START.
 
 Handlers are built as closures over injected dependencies so they stay
-unit-testable with fakes (no pipecat / twilio imports here).
-
-Handler invariants:
-  - **Idempotent.** A handler may be invoked twice for the same transcript if
-    the runner cancels and retries. Don't fire side effects (webhooks, DB
-    writes) directly — record the intent in state and let the runner act.
-  - **Cancellation-safe.** Handlers must tolerate `CancelledError` raised
-    inside any `await`. Since handlers return partial dicts rather than
-    mutating shared state, this is mostly automatic — but any external
-    side effect must sit inside `try/finally`.
-  - **No partial state on error.** Routing errors and exceptions land in the
-    `fallback` node, never as half-written real state.
+unit-testable with fakes (no pipecat / twilio imports here). Handlers must be
+idempotent and cancellation-safe; errors return `_to_fallback`, never partial state.
 """
 
 from __future__ import annotations
@@ -159,7 +149,5 @@ def build_graph(llm: LLMClient, classifier: IVRClassifier) -> CompiledStateGraph
     for n in NODES:
         builder.add_edge(n, END)
 
-    # No checkpointer: per-call state is owned by `GraphRunner` in memory, and
-    # `MemorySaver` adds no value without a real durable store. Re-add a
-    # checkpointer only if resume-after-crash becomes a real requirement.
+    # No checkpointer: per-call state lives in GraphRunner; revisit if resume-after-crash matters.
     return builder.compile()
