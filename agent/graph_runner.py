@@ -11,11 +11,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
 
 import structlog
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.runnables import RunnableConfig
-from langgraph.errors import GraphRecursionError
+from langgraph.errors import GraphRecursionError, InvalidUpdateError
 from langgraph.graph.state import CompiledStateGraph
 
 from agent.graph import initial_state
@@ -24,6 +24,10 @@ from agent.observability import flush_langfuse
 from agent.schemas import FALLBACK_RESPONSE, CallState, PatientInfo
 
 QUEUE_MAX = 8
+# Per-turn cap on graph supersteps. Each turn is one user utterance routed
+# through one handler that returns to END, so a healthy turn uses 1-2 steps.
+# Anything past 10 means a handler is looping back to itself or a routing key
+# isn't terminating — bail to fallback rather than spinning the LLM forever.
 RECURSION_LIMIT = 10
 
 
@@ -43,7 +47,7 @@ class GraphRunner:
         *,
         queue_max: int = QUEUE_MAX,
         recursion_limit: int = RECURSION_LIMIT,
-        callbacks: Sequence[Any] | None = None,
+        callbacks: Sequence[BaseCallbackHandler] | None = None,
     ) -> None:
         self.graph = graph
         self.call_ctx = call_ctx
@@ -190,11 +194,22 @@ class GraphRunner:
         }
         if self.callbacks:
             config["callbacks"] = self.callbacks
+        # `ainvoke` (not `astream_events`): the TTS service handles streaming
+        # downstream of the runner, and per-turn we only need the final state +
+        # response_text. `astream_events` would buy partial tokens we'd just
+        # buffer and discard, plus more code in the consumer loop.
         try:
             result = await self.graph.ainvoke(turn_state, config=config)
         except GraphRecursionError:
             log.warning("graph_recursion_limit")
             return self._hard_fallback("recursion_limit")
+        except InvalidUpdateError as exc:
+            # Distinct from generic node exceptions: this signals a handler
+            # returned a state shape that violates the channel reducer
+            # contract (typically a non-dict, or wrong types). It's a graph-
+            # construction bug, not a runtime data issue — surface it loudly.
+            log.exception("graph_invalid_update", error=str(exc))
+            return self._hard_fallback("graph_invalid_update")
         except Exception as exc:  # noqa: BLE001
             # Scope this to the graph invocation only. If _hard_fallback
             # itself raises (a real bug), we want the exception to propagate
