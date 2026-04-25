@@ -17,9 +17,13 @@ from typing import Any
 from agent.logging_config import log
 
 
+def _langfuse_enabled() -> bool:
+    return bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
+
+
 def langfuse_callbacks() -> list[Any]:
     """Return a `[CallbackHandler]` when Langfuse env is set, else `[]`."""
-    if not (os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")):
+    if not _langfuse_enabled():
         log.info("langfuse_disabled", reason="env_missing")
         return []
 
@@ -30,3 +34,20 @@ def langfuse_callbacks() -> list[Any]:
     handler = CallbackHandler()
     log.info("langfuse_enabled", host=os.getenv("LANGFUSE_HOST", "<default>"))
     return [handler]
+
+
+def flush_langfuse() -> None:
+    """Flush pending Langfuse events. Safe to call when Langfuse is disabled.
+
+    Langfuse batches spans and flushes on a timer; if the process tears down
+    between turns we lose the tail. `GraphRunner.stop()` calls this on every
+    transport-disconnect so per-call traces always land.
+    """
+    if not _langfuse_enabled():
+        return
+    try:
+        from langfuse import get_client
+
+        get_client().flush()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("langfuse_flush_failed", error=str(exc))

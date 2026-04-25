@@ -20,6 +20,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from agent.graph import initial_state
 from agent.logging_config import log
+from agent.observability import flush_langfuse
 from agent.schemas import FALLBACK_RESPONSE, CallState, PatientInfo
 
 QUEUE_MAX = 8
@@ -84,6 +85,9 @@ class GraphRunner:
             except Exception as exc:  # noqa: BLE001
                 # A task that crashed during shutdown is still a real bug — don't silently swallow.
                 log.warning("task_error_during_stop", task=task.get_name(), error=str(exc))
+        # Drain Langfuse's batch buffer before transport-disconnect tears the
+        # process down, otherwise the last few spans of the call never land.
+        flush_langfuse()
 
     def submit_transcript(self, text: str) -> None:
         """Non-blocking enqueue with drop-oldest on full. Callable from Pipecat."""
