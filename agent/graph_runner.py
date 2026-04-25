@@ -27,7 +27,7 @@ from agent.schemas import FALLBACK_RESPONSE, CallState, PatientInfo
 QUEUE_MAX = 8
 # Healthy turn = 1-2 supersteps; >10 means a handler is looping itself.
 RECURSION_LIMIT = 10
-TURN_TAGS = ["voiceadmin", "eligibility"]
+TURN_TAGS: tuple[str, ...] = ("voiceadmin", "eligibility")
 
 
 @dataclass
@@ -62,7 +62,7 @@ class GraphRunner:
         self._base_metadata: dict[str, Any] = {
             "langfuse_session_id": call_ctx.call_sid,
             "langfuse_user_id": call_ctx.patient.member_id,
-            "langfuse_tags": TURN_TAGS,
+            "langfuse_tags": list(TURN_TAGS),
         }
 
     async def start(self) -> None:
@@ -96,7 +96,7 @@ class GraphRunner:
                 log.warning("task_error_during_stop", task=task.get_name(), error=str(exc))
         # Drain Langfuse's batch buffer before transport-disconnect tears the
         # process down, otherwise the last few spans of the call never land.
-        flush_langfuse()
+        await flush_langfuse()
 
     def submit_transcript(self, text: str) -> None:
         """Non-blocking enqueue with drop-oldest on full. Callable from Pipecat."""
@@ -185,7 +185,7 @@ class GraphRunner:
         config: RunnableConfig = {
             "recursion_limit": self.recursion_limit,
             "run_name": f"turn-{turn_index}",
-            "tags": TURN_TAGS,
+            "tags": list(TURN_TAGS),
             "metadata": {**self._base_metadata, "turn_index": turn_index},
         }
         if self.callbacks:
