@@ -7,15 +7,17 @@ Flow per inbound call:
   2. Twilio opens WSS to /ws → we read the first "start" message to grab
      `streamSid` + `callSid`, then build the transport + pipeline.
   3. Pipeline = transport.input() → Deepgram STT → StateMachineProcessor → Cartesia TTS → transport.output()
-  4. StateMachineProcessor spawns/stops the GraphRunner on StartFrame/EndFrame.
+  4. StateMachineProcessor spawns/stops the CallSessionRunner on StartFrame/EndFrame.
 
 Pair this app with `ngrok http 8000` to expose a public URL to Twilio.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket
@@ -30,15 +32,14 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+from twilio.rest import Client as TwilioRestClient
 
-from agent.classifier import RuleBasedClassifier
-from agent.graph import build_graph
-from agent.graph_runner import CallContext, GraphRunner
-from agent.llm_client import GroqLLMClient
+from agent import tools
+from agent.call_session import CallSessionRunner, IVRLLMClient
+from agent.llm_client import AnthropicRepClient
 from agent.logging_config import configure_logging, log
-from agent.observability import langfuse_callbacks
 from agent.processors.state_processor import StateMachineProcessor
-from agent.schemas import PatientInfo
+from agent.schemas import CallSession, IVRTurnResponse, PatientInfo, Turn
 
 load_dotenv()
 configure_logging()
@@ -48,15 +49,58 @@ app = FastAPI()
 # Twilio μ-law at 8kHz. Override via env if you rewire the stream.
 TWILIO_SAMPLE_RATE = int(os.getenv("TWILIO_SAMPLE_RATE", "8000"))
 
+_IVR_SYSTEM_PROMPT = (
+    "You are an IVR navigation agent. Use the provided tools to send DTMF, "
+    "speak briefly when needed, record benefits the IVR reads aloud, and "
+    "transfer to the rep when the IVR signals a handoff."
+)
+_REP_PROMPT_TEMPLATE = (Path(__file__).parent / "prompts" / "rep_turn.v1.txt").read_text()
+
 
 def _default_patient() -> PatientInfo:
-    # Hard-coded for the M4 manual-call smoke test. Real caller lookup lands at M6.
     return PatientInfo(
         member_id=os.getenv("PATIENT_MEMBER_ID", "M123456"),
         first_name=os.getenv("PATIENT_FIRST_NAME", "Alice"),
         last_name=os.getenv("PATIENT_LAST_NAME", "Example"),
         dob=os.getenv("PATIENT_DOB", "1980-05-12"),
     )
+
+
+def _rep_system_prompt(patient: PatientInfo) -> str:
+    return _REP_PROMPT_TEMPLATE.format(
+        patient_name=f"{patient.first_name} {patient.last_name}",
+        member_id=patient.member_id,
+        patient_dob=patient.dob,
+    )
+
+
+@functools.cache
+def _twilio_rest_client() -> TwilioRestClient:
+    return TwilioRestClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+
+
+class _UnimplementedIVRClient:
+    """Fail-fast placeholder for the Groq tool-calling IVR client.
+
+    Raises at construction so a misconfigured live deployment dies before
+    audio starts flowing, not several seconds into the call. Replace with
+    a real `IVRLLMClient` implementation before wiring live calls.
+    """
+
+    def __init__(self) -> None:
+        raise NotImplementedError(
+            "IVR tool-calling client is not wired. Replace `_UnimplementedIVRClient()` "
+            "in agent/main.py with a real IVRLLMClient before accepting live calls."
+        )
+
+    async def complete_with_tools(
+        self,
+        system: str,
+        history: list[Turn],
+        tools: list[dict[str, object]],
+        temperature: float = 0.1,
+    ) -> IVRTurnResponse:
+        raise NotImplementedError
 
 
 @app.post("/twiml")
@@ -113,13 +157,19 @@ async def ws(websocket: WebSocket) -> None:
         voice_id=os.environ.get("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
     )
 
-    llm = GroqLLMClient()
-    classifier = RuleBasedClassifier()
-    graph = build_graph(llm, classifier)
-    runner = GraphRunner(
-        graph,
-        CallContext(call_sid=call_sid, patient=_default_patient()),
-        callbacks=langfuse_callbacks(),
+    patient = _default_patient()
+    session = CallSession(call_sid=call_sid, patient=patient)
+    ivr_llm: IVRLLMClient = _UnimplementedIVRClient()
+    rep_llm = AnthropicRepClient()
+    runner = CallSessionRunner(
+        session=session,
+        ivr_llm=ivr_llm,
+        rep_llm=rep_llm,
+        tool_dispatcher=tools.dispatch,
+        ivr_system_prompt=_IVR_SYSTEM_PROMPT,
+        rep_system_prompt=_rep_system_prompt(patient),
+        tools=[],
+        twilio_client=_twilio_rest_client(),
     )
     state_proc = StateMachineProcessor(runner)
 
