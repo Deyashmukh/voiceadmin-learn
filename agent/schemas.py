@@ -28,11 +28,15 @@ class Benefits(BaseModel):
     out_of_network_coverage: bool | None = None
 
 
+TransitionTarget = Literal["rep_wait", "ivr_extract"]
+
+
 class ClassifierResult(BaseModel):
     """Output of the rule-based IVR keyword classifier."""
 
-    outcome: Literal["dtmf", "speak", "unknown"]
+    outcome: Literal["dtmf", "speak", "transition", "unknown"]
     dtmf: str | None = None
+    transition_to: TransitionTarget | None = None
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
 
 
@@ -61,4 +65,4 @@ class LLMClient(Protocol):
 class IVRClassifier(Protocol):
     """Injected rule-based IVR keyword classifier."""
 
-    def classify(self, transcript: str) -> ClassifierResult: ...
+    def classify(self, transcript: str, patient: PatientInfo | None = None) -> ClassifierResult: ...
