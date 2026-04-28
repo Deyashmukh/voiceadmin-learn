@@ -1,16 +1,14 @@
-"""LLM clients for Groq (extraction / IVR side) and Anthropic (rep side).
+"""LLM clients for Anthropic (rep side) and Groq (legacy M3 client).
 
-Two backends with intentionally different shapes:
-
-- `GroqLLMClient`: Llama 4 Scout / Qwen3 via Groq's chat completions. One-shot
-  `complete_free_form` / `complete_structured(system, user, schema)`. Used by the
-  retiring M3/M4 graph; M5'/D1 will get a separate tool-calling Groq client.
 - `AnthropicRepClient`: Claude Haiku 4.5 via Anthropic's `messages.parse()` —
   multi-turn `complete_structured(system, history, schema)` for rep-mode
   conversation. Persona prompt marked for prompt caching.
+- `GroqLLMClient`: legacy M3 client kept temporarily until the new tool-calling
+  Groq client (D1.5 follow-up) lands; nothing references it post-M5'/E.
 
-`@observe` makes the raw SDK calls visible to Langfuse — they bypass
-`langchain_core`, so the LangGraph callback handler alone can't see them.
+`@observe` decorators on the SDK calls produce one Langfuse generation span
+per LLM round-trip, nested under the per-turn span declared in
+`agent/call_session.py`.
 """
 
 from __future__ import annotations

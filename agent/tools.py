@@ -13,8 +13,10 @@ from a rejection round-trip.
 
 from __future__ import annotations
 
+from langfuse import observe
 from pydantic import BaseModel, ValidationError
 
+from agent.observability import set_current_span_name
 from agent.schemas import (
     BenefitField,
     CallSession,
@@ -64,6 +66,7 @@ def _reject(message: str) -> ToolResult:
     return ToolResult(success=False, advanced_call_state=False, message=message)
 
 
+@observe(name="tool_dispatch")
 async def dispatch(call: ToolCall, session: CallSession) -> ToolResult:
     """Validate `call` against its schema + session state, then apply effects.
 
@@ -74,7 +77,8 @@ async def dispatch(call: ToolCall, session: CallSession) -> ToolResult:
     """
     # `call.name` is `ToolName` Literal — registry has every variant by
     # construction, so the lookup is total. Hallucinated tool names from the
-    # LLM are caught at the client boundary (M5'/C) before reaching here.
+    # LLM are caught at the client boundary before reaching here.
+    set_current_span_name(f"tool_dispatch.{call.name}")
     schema = TOOL_ARG_MODELS[call.name]
     try:
         args = schema.model_validate(call.args)

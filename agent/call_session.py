@@ -19,10 +19,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 import structlog
+from langfuse import observe
 from pydantic import BaseModel
 
 from agent.actuator import Actuator, CallActuator
 from agent.logging_config import log
+from agent.observability import trace_session
 from agent.schemas import (
     CallSession,
     IVRTurnResponse,
@@ -193,17 +195,20 @@ class CallSessionRunner:
                 log.info("call_session_complete", reason=self.session.completion_reason)
                 return
 
+    @observe(name="call_turn")
     async def _run_turn(self, transcript: str) -> None:
-        self.session.history.append(Turn(role="user", content=transcript))
-        # If the turn is cancelled mid-flight (barge-in), turn_count is NOT
-        # incremented and the watchdog counter is NOT touched — barge-in is
-        # a re-do, not a "tried and failed" turn.
-        if self.session.mode == "rep":
-            await self._rep_turn()
-        else:
-            await self._ivr_turn()
-        self.session.turn_count += 1
+        with trace_session(self.session.call_sid):
+            self.session.history.append(Turn(role="user", content=transcript))
+            # If the turn is cancelled mid-flight (barge-in), turn_count is NOT
+            # incremented and the watchdog counter is NOT touched — barge-in is
+            # a re-do, not a "tried and failed" turn.
+            if self.session.mode == "rep":
+                await self._rep_turn()
+            else:
+                await self._ivr_turn()
+            self.session.turn_count += 1
 
+    @observe(name="ivr_turn")
     async def _ivr_turn(self) -> None:
         response = await self.ivr_llm.complete_with_tools(
             system=self.ivr_system_prompt,
@@ -246,6 +251,7 @@ class CallSessionRunner:
         else:
             self.session.ivr_no_progress_turns = 0
 
+    @observe(name="rep_turn")
     async def _rep_turn(self) -> None:
         # Slice history starting at the mode-flip point so the rep LLM doesn't
         # receive the IVR phase's user transcripts (which would arrive as
