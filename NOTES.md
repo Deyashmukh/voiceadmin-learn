@@ -77,3 +77,33 @@ empty. Regression locked in by
 Meta-lesson: offline unit tests with fake LLMs can miss wire-level composition
 bugs — our fakes returned deterministic responses per turn, so the stale-carry
 never manifested. The REPL check with a real LLM exposed it immediately.
+
+# M5 surprises
+
+## 5. `log.exception` blocks the event loop ~1.5s on its own when structlog isn't configured
+
+Three pre-existing tests assert behavior that runs through `_run_turn`'s
+`except Exception` branch (which calls `log.exception("node_error", ...)`).
+When `agent.logging_config.configure_logging()` hasn't been called — which is
+the default in tests, since none of them import `agent.main` — structlog falls
+back to a Rich-rendered `ConsoleRenderer`. Rendering a deep traceback through
+the asyncio + langgraph + pydantic stack takes ~1.5s. That's longer than the
+test timeouts (`asyncio.wait_for(out_queue.get(), timeout=1.0)`), so the tests
+flake under load and on slower runs.
+
+The naïve fix — call `configure_logging()` from `tests/unit/conftest.py` — runs
+into `cache_logger_on_first_use=True`: once the bound logger in
+`agent.logging_config.log` is captured, subsequent `structlog.configure()` calls
+elsewhere don't propagate. `test_every_log_from_runner_has_call_sid` relies on
+reconfiguring structlog at runtime to install a capture processor; adding a
+session-level configure in conftest broke that test.
+
+Tests affected (run order matters; the symptom is "1 passed in 0.5s" alone but
+"3 failed in ~30s" inside the full suite):
+- `test_handler_exception_routes_to_fallback` (in both
+  `test_graph_runner.py` and `test_state_processor.py`)
+- `test_contextvars_propagate_into_run_turn`
+
+Real-call implication: a handler raising in production blocks the event loop
+for ~1.5s during fallback-traceback rendering. Acceptable in the fallback
+path, but worth knowing. M5 leaves this as-is; a proper fix is a follow-up.

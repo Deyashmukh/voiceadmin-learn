@@ -49,7 +49,7 @@ class FakeClassifier:
     results: list[ClassifierResult] = field(default_factory=list)
     calls: list[str] = field(default_factory=list)
 
-    def classify(self, transcript: str) -> ClassifierResult:
+    def classify(self, transcript: str, patient: PatientInfo | None = None) -> ClassifierResult:
         self.calls.append(transcript)
         if not self.results:
             return ClassifierResult(outcome="speak", confidence=1.0)
