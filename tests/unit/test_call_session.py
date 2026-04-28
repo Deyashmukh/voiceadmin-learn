@@ -1,7 +1,7 @@
-"""Unit tests for M5'/D1: CallSessionRunner — IVR-only turn loop, watchdog,
-interrupt + queue drain. Zero network — IVR LLM is faked; the default
-CallActuator (with no twilio_client) routes SpeakIntent into out_queue
-natively, so tests can read spoken text from there directly."""
+"""Unit tests for CallSessionRunner — IVR turn loop (D1), rep turn handler
++ mode-aware dispatch (D2/D3). Zero network — both LLMs are faked; the
+default CallActuator (with no twilio_client) routes SpeakIntent into
+out_queue natively, so tests can read spoken text from there directly."""
 
 from __future__ import annotations
 
@@ -16,35 +16,44 @@ from agent import tools
 from agent.actuator import CallActuator
 from agent.call_session import CallSessionRunner
 from agent.schemas import (
+    Benefits,
     DTMFIntent,
     IVRTurnResponse,
+    RepTurnOutput,
     SideEffectIntent,
+    SpeakIntent,
     ToolCall,
 )
 
-from .conftest import FakeActuator, FakeIVRLLMClient
+from .conftest import FakeActuator, FakeAnthropicRepClient, FakeIVRLLMClient
 
 
 def _build_runner(
     session,
     *,
     ivr_llm: FakeIVRLLMClient | None = None,
+    rep_llm: FakeAnthropicRepClient | None = None,
     actuator=None,
-) -> tuple[CallSessionRunner, FakeIVRLLMClient]:
-    """Construct a CallSessionRunner with the FakeIVRLLMClient pre-installed.
-    Default actuator is the runner's auto-built `CallActuator` (no twilio_client),
-    which routes SpeakIntent → out_queue natively. Tests pass an explicit
-    `FakeActuator` when they want to assert on intents directly."""
-    llm = ivr_llm or FakeIVRLLMClient()
+    tool_dispatcher=None,
+) -> tuple[CallSessionRunner, FakeIVRLLMClient, FakeAnthropicRepClient]:
+    """Construct a CallSessionRunner with both LLM fakes pre-installed.
+    Default actuator is the runner's auto-built `CallActuator` (no
+    twilio_client), which routes SpeakIntent → out_queue natively. Tests
+    pass an explicit `FakeActuator` when they want to assert on intents
+    directly, or an alternative `tool_dispatcher` to inject failures."""
+    ivr = ivr_llm or FakeIVRLLMClient()
+    rep = rep_llm or FakeAnthropicRepClient()
     runner = CallSessionRunner(
         session=session,
-        ivr_llm=llm,
-        tool_dispatcher=tools.dispatch,
+        ivr_llm=ivr,
+        rep_llm=rep,
+        tool_dispatcher=tool_dispatcher or tools.dispatch,
         ivr_system_prompt="ivr-system-prompt",
+        rep_system_prompt="rep-persona-prompt",
         tools=[{"name": "send_dtmf"}],
         actuator=actuator,
     )
-    return runner, llm
+    return runner, ivr, rep
 
 
 async def _wait_until(predicate, timeout: float = 1.0) -> None:
@@ -60,7 +69,7 @@ async def _wait_until(predicate, timeout: float = 1.0) -> None:
 
 
 async def test_submit_transcript_drops_oldest_when_full(make_session):
-    runner, _ = _build_runner(make_session())
+    runner, _, _ = _build_runner(make_session())
     for i in range(15):
         runner.submit_transcript(f"item-{i}")
     assert runner.in_queue.qsize() == 8
@@ -78,7 +87,7 @@ async def test_ivr_turn_dispatches_send_dtmf_intent(make_session):
     """Turn 1 sends DTMF, turn 2 completes the call. Use a FakeActuator so
     we can assert on the intents directly."""
     actuator = FakeActuator()
-    runner, ivr_llm = _build_runner(make_session(), actuator=actuator)
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=actuator)
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="send_dtmf", args={"digits": "1"})]),
         IVRTurnResponse(
@@ -98,7 +107,7 @@ async def test_ivr_turn_dispatches_send_dtmf_intent(make_session):
 
 
 async def test_ivr_turn_records_history(make_session):
-    runner, ivr_llm = _build_runner(make_session(), actuator=FakeActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "one moment"})]),
         IVRTurnResponse(
@@ -126,7 +135,7 @@ async def test_ivr_turn_records_history(make_session):
 async def test_speak_intent_is_pushed_to_out_queue(make_session):
     """The default CallActuator routes SpeakIntent.text into out_queue —
     that's the production wire to Cartesia via state_processor."""
-    runner, ivr_llm = _build_runner(make_session())
+    runner, ivr_llm, _rep = _build_runner(make_session())
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "hello there"})]),
     ]
@@ -147,7 +156,7 @@ async def test_validator_rejection_does_not_advance_call_state(make_session):
     `advanced_call_state=False`, so the turn doesn't count as progress and
     the watchdog ticks. Two such turns trip the watchdog."""
     actuator = FakeActuator()
-    runner, ivr_llm = _build_runner(
+    runner, ivr_llm, _rep = _build_runner(
         make_session(recent_menu_options=["1", "2", "3"]), actuator=actuator
     )
     ivr_llm.responses = [
@@ -173,7 +182,7 @@ async def test_watchdog_trips_on_zero_tool_call_turns(make_session):
     """If the LLM produces no tool calls at all (timeout / hallucinated text
     response with no tools), the watchdog must still tick. Two such turns
     in a row → terminate."""
-    runner, ivr_llm = _build_runner(make_session(), actuator=FakeActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [IVRTurnResponse(), IVRTurnResponse()]
     try:
         await runner.start()
@@ -187,7 +196,7 @@ async def test_watchdog_trips_on_zero_tool_call_turns(make_session):
 
 async def test_watchdog_resets_on_an_advancing_turn(make_session):
     """One bad turn followed by a good turn must reset the counter."""
-    runner, ivr_llm = _build_runner(make_session(), actuator=FakeActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
         IVRTurnResponse(),  # 1 no-progress
         IVRTurnResponse(  # advances → counter resets
@@ -212,7 +221,7 @@ async def test_watchdog_resets_on_an_advancing_turn(make_session):
 async def test_mark_interrupted_drains_out_queue(make_session):
     """A turn that finished moments before the user started speaking would
     otherwise still get spoken after the barge-in. Drain first."""
-    runner, _ = _build_runner(make_session())
+    runner, _, _ = _build_runner(make_session())
     await runner.out_queue.put("stale-1")
     await runner.out_queue.put("stale-2")
     runner.mark_interrupted()
@@ -221,7 +230,7 @@ async def test_mark_interrupted_drains_out_queue(make_session):
 
 async def test_interrupt_drains_in_queue(make_session):
     """Barge-in should not let stale queued transcripts feed the next turn."""
-    runner, _ = _build_runner(make_session())
+    runner, _, _ = _build_runner(make_session())
     runner.submit_transcript("stale-A")
     runner.submit_transcript("stale-B")
     assert runner.in_queue.qsize() == 2
@@ -233,7 +242,7 @@ async def test_mark_interrupted_cancels_in_flight_turn(make_session):
     """A slow LLM call (simulated via slow_mode_seconds) is cancelled cleanly
     by mark_interrupted — the turn task receives CancelledError, the consumer
     catches it, and the loop continues."""
-    runner, ivr_llm = _build_runner(make_session(), actuator=FakeActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.slow_mode_seconds = 5.0
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "won't reach"})])
@@ -255,7 +264,7 @@ async def test_mark_interrupted_cancels_in_flight_turn(make_session):
 async def test_mark_interrupted_does_not_complete_call(make_session):
     """Interrupt is a turn-level cancel, not a session-level abort. The runner
     keeps consuming after the interrupt clears."""
-    runner, ivr_llm = _build_runner(make_session(), actuator=FakeActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.slow_mode_seconds = 5.0
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "won't reach"})]),
@@ -290,18 +299,16 @@ async def test_cancellation_mid_tool_dispatch_pairs_history(make_session):
         await asyncio.sleep(5.0)  # cancelled before dispatch finishes
         return await tools.dispatch(call, session)
 
-    session = make_session()
     ivr_llm = FakeIVRLLMClient(
         responses=[IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "x"})])]
     )
-    runner = CallSessionRunner(
-        session=session,
+    runner, _, _ = _build_runner(
+        make_session(),
         ivr_llm=ivr_llm,
-        tool_dispatcher=_slow_dispatcher,
-        ivr_system_prompt="x",
-        tools=[],
         actuator=FakeActuator(),
+        tool_dispatcher=_slow_dispatcher,
     )
+    session = runner.session
     try:
         await runner.start()
         runner.submit_transcript("kickoff")
@@ -324,7 +331,7 @@ async def test_cancellation_mid_tool_dispatch_pairs_history(make_session):
 
 async def test_stop_cancels_in_flight_turn_quickly(make_session):
     """stop() must complete promptly even when a turn is mid-LLM-call."""
-    runner, ivr_llm = _build_runner(make_session(), actuator=FakeActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.slow_mode_seconds = 5.0
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "won't reach"})])
@@ -342,7 +349,7 @@ async def test_consumer_exits_after_complete_call_without_extra_transcript(make_
     """When the LLM emits `complete_call`, the consumer must exit the loop
     immediately rather than blocking on `in_queue.get()` waiting for a
     transcript that will never arrive."""
-    runner, ivr_llm = _build_runner(make_session(), actuator=FakeActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
         IVRTurnResponse(
             tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
@@ -369,17 +376,14 @@ async def test_consumer_death_sets_completion_reason(make_session):
     async def _exploding_dispatcher(call, session):
         raise RuntimeError("boom")
 
-    session = make_session()
     ivr_llm = FakeIVRLLMClient(
         responses=[IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "x"})])]
     )
-    runner = CallSessionRunner(
-        session=session,
+    runner, _, _ = _build_runner(
+        make_session(),
         ivr_llm=ivr_llm,
-        tool_dispatcher=_exploding_dispatcher,
-        ivr_system_prompt="x",
-        tools=[],
         actuator=FakeActuator(),
+        tool_dispatcher=_exploding_dispatcher,
     )
     try:
         await runner.start()
@@ -404,7 +408,7 @@ async def test_call_sid_bound_in_contextvars_during_turn(make_session):
         async def execute(self, intent: SideEffectIntent) -> None:
             captured.append(dict(structlog.contextvars.get_contextvars()))
 
-    runner, ivr_llm = _build_runner(make_session(), actuator=_ContextvarCapturingActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=_ContextvarCapturingActuator())
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "x"})]),
         IVRTurnResponse(
@@ -431,7 +435,7 @@ async def test_call_sid_bound_in_contextvars_during_turn(make_session):
 async def test_each_queued_transcript_drives_its_own_turn(make_session):
     """Without barge-in, multiple queued transcripts must each fire a
     distinct turn — distinct user utterances are not collapsed."""
-    runner, ivr_llm = _build_runner(make_session(), actuator=FakeActuator())
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.slow_mode_seconds = 0.02
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "one"})]),
@@ -464,3 +468,300 @@ async def test_call_actuator_without_twilio_client_rejects_dtmf(make_session):
     actuator = CallActuator(session=session, out_queue=out_queue, twilio_client=None)
     with pytest.raises(RuntimeError, match="DTMFIntent emitted but actuator has no twilio_client"):
         await actuator.execute(DTMFIntent(digits="1"))
+
+
+# --- Rep-mode turn handler (D2) -------------------------------------------
+
+
+async def test_rep_turn_speaks_reply_and_merges_partial_benefits(make_session):
+    """Happy path: rep LLM returns reply + a partial Benefits extraction.
+    The reply is spoken via SpeakIntent; non-None Benefits fields are merged
+    into session.benefits while None fields are preserved (no overwrite)."""
+    actuator = FakeActuator()
+    runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=actuator)
+    rep_llm.responses = [
+        RepTurnOutput(
+            reply="Got it. What's the deductible?",
+            extracted=Benefits(active=True, copay=30.0),
+            phase="extracting",
+        ),
+        RepTurnOutput(
+            reply="Thanks, that's everything I needed. Have a great day.",
+            extracted=Benefits(deductible_remaining=250.0),
+            phase="complete",
+        ),
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("Hi, this is Sam.")
+        runner.submit_transcript("The deductible remaining is 250.")
+        await _wait_until(lambda: runner.session.done)
+        # Two SpeakIntents (one per turn).
+        speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
+        assert len(speaks) == 2
+        assert "deductible" in speaks[0].text
+        # Both partial extractions merged: active + copay from turn 1, then
+        # deductible_remaining added from turn 2 (without erasing the prior).
+        assert runner.session.benefits.active is True
+        assert runner.session.benefits.copay == 30.0
+        assert runner.session.benefits.deductible_remaining == 250.0
+        # phase="complete" → rep_complete.
+        assert runner.session.completion_reason == "rep_complete"
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_complete_phase_ends_call(make_session):
+    runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=FakeActuator())
+    rep_llm.responses = [
+        RepTurnOutput(
+            reply="That's everything. Thanks!",
+            extracted=Benefits(),
+            phase="complete",
+        )
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("Anything else?")
+        await _wait_until(lambda: runner.session.done)
+        assert runner.session.completion_reason == "rep_complete"
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_two_consecutive_stuck_phases_end_call(make_session):
+    """Watchdog: phase='stuck' for 2 consecutive turns terminates with
+    rep_stuck. Distinct from llm_aborted_rep (deliberate fail_with_reason
+    on the IVR side)."""
+    runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=FakeActuator())
+    rep_llm.responses = [
+        RepTurnOutput(reply="Could you repeat?", extracted=Benefits(), phase="stuck"),
+        RepTurnOutput(
+            reply="Sorry, I'm having trouble. Goodbye.", extracted=Benefits(), phase="stuck"
+        ),
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("garbled-1")
+        runner.submit_transcript("garbled-2")
+        await _wait_until(lambda: runner.session.done)
+        assert runner.session.completion_reason == "rep_stuck"
+        assert runner.session.stuck_turns == 2
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_stuck_counter_resets_on_extracting_turn(make_session):
+    """A non-stuck turn between two stuck turns resets the counter — only
+    consecutive stuck turns count toward the watchdog."""
+    runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=FakeActuator())
+    rep_llm.responses = [
+        RepTurnOutput(reply="?", extracted=Benefits(), phase="stuck"),  # 1
+        RepTurnOutput(  # advances → counter resets
+            reply="Got it",
+            extracted=Benefits(active=True),
+            phase="extracting",
+        ),
+        RepTurnOutput(reply="?", extracted=Benefits(), phase="stuck"),  # 1 (just reset)
+        RepTurnOutput(reply="goodbye", extracted=Benefits(), phase="stuck"),  # 2 → end
+    ]
+    try:
+        await runner.start()
+        for i in range(4):
+            runner.submit_transcript(f"transcript-{i}")
+        await _wait_until(lambda: runner.session.done)
+        assert runner.session.completion_reason == "rep_stuck"
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_empty_reply_does_not_speak(make_session):
+    """Hold-music / silent-listening case: reply='' → actuator gets no
+    SpeakIntent, but the rep turn still records a Turn in history."""
+    actuator = FakeActuator()
+    runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=actuator)
+    rep_llm.responses = [
+        RepTurnOutput(reply="", extracted=Benefits(), phase="extracting"),
+        RepTurnOutput(
+            reply="That's everything",
+            extracted=Benefits(),
+            phase="complete",
+        ),
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("[hold music transcript]")
+        runner.submit_transcript("Final answer.")
+        await _wait_until(lambda: runner.session.done)
+        speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
+        assert len(speaks) == 1  # only the second turn produced one
+        assert speaks[0].text == "That's everything"
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_records_assistant_history_with_extracted(make_session):
+    """The runner appends the assistant turn with the partial Benefits
+    extraction recorded — useful for trace replay / debugging."""
+    runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=FakeActuator())
+    extracted = Benefits(active=True, copay=30.0)
+    rep_llm.responses = [RepTurnOutput(reply="Got it.", extracted=extracted, phase="complete")]
+    try:
+        await runner.start()
+        runner.submit_transcript("Coverage active, copay 30.")
+        await _wait_until(lambda: runner.session.done)
+        assistant_turns = [t for t in runner.session.history if t.role == "assistant"]
+        assert len(assistant_turns) == 1
+        assert assistant_turns[0].content == "Got it."
+        # The partial extraction is recorded on the turn for trace inspection.
+        assert assistant_turns[0].extracted == extracted
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_filters_tool_history_when_calling_llm(make_session):
+    """Rep mode shouldn't see the IVR phase's tool_call/tool_result entries —
+    the rep LLM only handles user/assistant text. With `mode="rep"` set
+    directly (no transfer_to_rep flip), `rep_mode_index` is None, so the
+    helper sees the full history minus tool entries."""
+    from agent.schemas import Turn
+
+    session = make_session(mode="rep")
+    session.history.extend(
+        [
+            Turn(role="user", content="hello there"),
+            Turn(role="tool_call", tool_call=ToolCall(name="speak", args={"text": "x"})),
+            Turn(role="tool_result", content="dispatched"),
+            Turn(role="assistant", content="how can I help?"),
+        ]
+    )
+    runner, _, rep_llm = _build_runner(session, actuator=FakeActuator())
+    rep_llm.responses = [RepTurnOutput(reply="hi sam", extracted=Benefits(), phase="complete")]
+    try:
+        await runner.start()
+        runner.submit_transcript("hello, this is sam")
+        await _wait_until(lambda: runner.session.done)
+        sent_history = rep_llm.calls[0][1]
+        roles = [m["role"] for m in sent_history]
+        # tool_call / tool_result filtered out; user + assistant + new user kept.
+        assert roles == ["user", "assistant", "user"]
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_skips_pre_flip_history_after_transfer(make_session):
+    """**Regression for the consecutive-user-message Anthropic 400 bug.**
+    After transfer_to_rep flips the mode, the rep LLM must NOT see the IVR
+    phase's user transcripts — those would arrive as consecutive user
+    messages (Anthropic rejects). `rep_mode_index` records the flip point
+    so `_rep_turn` slices history from there."""
+    actuator = FakeActuator()
+    runner, ivr_llm, rep_llm = _build_runner(make_session(), actuator=actuator)
+    ivr_llm.responses = [
+        IVRTurnResponse(tool_calls=[ToolCall(name="send_dtmf", args={"digits": "1"})]),
+        IVRTurnResponse(tool_calls=[ToolCall(name="transfer_to_rep", args={})]),
+    ]
+    rep_llm.responses = [
+        RepTurnOutput(
+            reply="Hi Sam.",
+            extracted=Benefits(),
+            phase="complete",
+        )
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("Press 1 for eligibility")
+        runner.submit_transcript("Connecting you to a representative")
+        await _wait_until(lambda: runner.session.mode == "rep")
+        runner.submit_transcript("Hi, this is Sam.")
+        await _wait_until(lambda: runner.session.done)
+        # The rep LLM's first call must have received exactly one user
+        # message — the rep's greeting — not the two prior IVR transcripts.
+        sent_history = rep_llm.calls[0][1]
+        assert len(sent_history) == 1
+        assert sent_history[0]["role"] == "user"
+        assert sent_history[0]["content"] == "Hi, this is Sam."
+    finally:
+        await runner.stop()
+
+
+# --- Mode-aware routing + transfer_to_rep integration (D3) ----------------
+
+
+async def test_default_mode_is_ivr(make_session):
+    """A fresh session starts in IVR mode — `_run_turn` routes to
+    `_ivr_turn` until something flips the mode."""
+    runner, ivr_llm, rep_llm = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})])
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("kickoff")
+        await _wait_until(lambda: runner.session.done)
+        # IVR LLM was called, rep LLM was not.
+        assert len(ivr_llm.calls) == 1
+        assert len(rep_llm.calls) == 0
+    finally:
+        await runner.stop()
+
+
+async def test_transfer_to_rep_flips_mode_and_next_turn_routes_to_rep(make_session):
+    """Integration: IVR LLM emits transfer_to_rep on turn 1 → mode flips →
+    next transcript routes to _rep_turn (the rep LLM gets called)."""
+    actuator = FakeActuator()
+    runner, ivr_llm, rep_llm = _build_runner(make_session(), actuator=actuator)
+    ivr_llm.responses = [
+        IVRTurnResponse(tool_calls=[ToolCall(name="transfer_to_rep", args={})]),
+    ]
+    rep_llm.responses = [
+        RepTurnOutput(
+            reply="Hi Sam, calling about benefits.",
+            extracted=Benefits(),
+            phase="complete",
+        ),
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("Connecting you to a representative.")
+        # Mode flips during turn 1's tool dispatch.
+        await _wait_until(lambda: runner.session.mode == "rep")
+        runner.submit_transcript("Hi, this is Sam.")
+        await _wait_until(lambda: runner.session.done)
+        assert runner.session.mode == "rep"
+        assert len(ivr_llm.calls) == 1
+        assert len(rep_llm.calls) == 1
+        assert runner.session.completion_reason == "rep_complete"
+        # The rep's reply was spoken.
+        speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
+        assert any("Hi Sam" in s.text for s in speaks)
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_cancellation_propagates_cleanly(make_session):
+    """Symmetry with the IVR side: a slow rep LLM call cancelled by
+    mark_interrupted raises CancelledError cleanly, the consumer catches it,
+    no Benefits merge / history append / phase tick happens."""
+    actuator = FakeActuator()
+    runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=actuator)
+    rep_llm.slow_mode_seconds = 5.0
+    rep_llm.responses = [
+        RepTurnOutput(reply="won't reach", extracted=Benefits(active=True), phase="extracting"),
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("Hi, this is Sam.")
+        await _wait_until(
+            lambda: runner._current_turn is not None and not runner._current_turn.done()
+        )
+        runner.mark_interrupted()
+        await _wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())
+        # Cancelled before the LLM returned → no merge, no assistant Turn, no
+        # phase advancement, no completion.
+        assert runner.session.benefits.active is None
+        assert not any(t.role == "assistant" for t in runner.session.history)
+        assert runner.session.completion_reason is None
+        assert not any(isinstance(i, SpeakIntent) for i in actuator.executed)
+    finally:
+        await runner.stop()
