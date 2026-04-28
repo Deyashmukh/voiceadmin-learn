@@ -5,8 +5,9 @@ Langfuse reads credentials from env vars:
   - LANGFUSE_SECRET_KEY
   - LANGFUSE_HOST (defaults to the cloud host if unset)
 
-If neither key is set, `langfuse_callbacks()` returns an empty list and the
-runner falls back to local-only tracing. This keeps Langfuse strictly opt-in.
+When Langfuse is unavailable (env missing or backend unreachable), every
+helper here is a quiet no-op — the agent runs without traces but doesn't
+fail.
 """
 
 from __future__ import annotations
@@ -15,30 +16,12 @@ import asyncio
 import os
 from typing import Any
 
-from langchain_core.callbacks import BaseCallbackHandler
-
 from agent.logging_config import log
 
 FLUSH_TIMEOUT_S = 2.0
-
-
-def _langfuse_enabled() -> bool:
-    return bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
-
-
-def langfuse_callbacks() -> list[BaseCallbackHandler]:
-    """Return a `[CallbackHandler]` when Langfuse env is set, else `[]`."""
-    if not _langfuse_enabled():
-        log.info("langfuse_disabled", reason="env_missing")
-        return []
-
-    # Import lazily: an installed-but-unused langfuse shouldn't force env reads
-    # at module import time.
-    from langfuse.langchain import CallbackHandler
-
-    handler = CallbackHandler()
-    log.info("langfuse_enabled", host=os.getenv("LANGFUSE_HOST", "<default>"))
-    return [handler]
+# Captured once at import: dotenv has already loaded by the time agent.main
+# imports this module, and the keys don't rotate within a process.
+_LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
 
 
 async def flush_langfuse() -> None:
@@ -49,7 +32,7 @@ async def flush_langfuse() -> None:
     teardown path. Run it on a worker thread with a 2s budget — plenty for a
     healthy backend, won't block when it isn't.
     """
-    if not _langfuse_enabled():
+    if not _LANGFUSE_ENABLED:
         return
     try:
         from langfuse import get_client
@@ -63,7 +46,7 @@ async def flush_langfuse() -> None:
 
 def enrich_current_generation(*, model: str, usage: dict[str, Any] | None) -> None:
     """Attach model name and token usage to the active Langfuse generation span."""
-    if not _langfuse_enabled():
+    if not _LANGFUSE_ENABLED:
         return
     try:
         from langfuse import get_client

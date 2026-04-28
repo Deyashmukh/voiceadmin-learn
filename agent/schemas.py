@@ -1,9 +1,9 @@
-"""Shared data models and Protocol interfaces for the voice agent."""
+"""Shared data models for the voice agent."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Annotated, Literal, Protocol, TypedDict
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -231,47 +231,3 @@ class CallSession:
     def done(self) -> bool:
         """Single source of truth: the call is over once a reason is set."""
         return self.completion_reason is not None
-
-
-# --- Pre-pivot types kept here until M5'/E retires the modules using them ----
-# `agent/classifier.py` and `agent/graph.py` still import these. Removing them
-# in M5'/A would break the M4 wiring that hasn't been replaced yet.
-
-TransitionTarget = Literal["rep_wait", "ivr_extract"]
-
-
-class ClassifierResult(BaseModel):
-    """Output of the rule-based IVR keyword classifier (retiring in M5'/E)."""
-
-    outcome: Literal["dtmf", "speak", "transition", "unknown"]
-    dtmf: str | None = None
-    transition_to: TransitionTarget | None = None
-    confidence: float = Field(ge=0.0, le=1.0, default=0.0)
-
-
-class CallState(TypedDict, total=False):
-    """Per-call state owned by GraphRunner (retiring in M5'/E)."""
-
-    current_node: str
-    patient: PatientInfo | None
-    extracted: Benefits | None
-    turn_count: int
-    transcript: str
-    response_text: str | None
-    fallback_reason: str | None
-
-
-class LLMClient(Protocol):
-    """Injected LLM interface."""
-
-    async def complete_free_form(self, system: str, user: str) -> str: ...
-
-    async def complete_structured[T: BaseModel](
-        self, system: str, user: str, schema: type[T]
-    ) -> T: ...
-
-
-class IVRClassifier(Protocol):
-    """Injected rule-based IVR keyword classifier (retiring in M5'/E)."""
-
-    def classify(self, transcript: str, patient: PatientInfo | None = None) -> ClassifierResult: ...

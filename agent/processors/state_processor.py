@@ -1,7 +1,7 @@
-"""Pipecat adapter for `GraphRunner`.
+"""Pipecat adapter for `CallSessionRunner`.
 
-Kept deliberately thin. The rule from `CLAUDE.md` is absolute: LangGraph must
-not run inside `process_frame`. This processor only touches the runner via
+Kept deliberately thin. The CLAUDE.md non-negotiable: the call loop must not
+run inside `process_frame`. This processor only touches the runner via
 bounded queues and `Task.cancel()`, so audio-loop latency is unaffected by
 LLM work.
 """
@@ -23,12 +23,12 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from agent.graph_runner import GraphRunner
+from agent.call_session import CallSessionRunner
 from agent.logging_config import log
 
 
 class StateMachineProcessor(FrameProcessor):
-    """Bridge Pipecat frames to the graph runner.
+    """Bridge Pipecat frames to the call session runner.
 
     - Finalized `TranscriptionFrame`s are enqueued on `runner.in_queue`.
     - `UserStartedSpeakingFrame` / `InterruptionFrame` cancel the in-flight turn.
@@ -36,7 +36,7 @@ class StateMachineProcessor(FrameProcessor):
     - The runner's lifecycle is pinned to `StartFrame` / `EndFrame` / `CancelFrame`.
     """
 
-    def __init__(self, runner: GraphRunner, **kwargs: Any) -> None:
+    def __init__(self, runner: CallSessionRunner, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._runner = runner
         self._pump_task: asyncio.Task[None] | None = None
