@@ -76,8 +76,7 @@ async def dispatch(call: ToolCall, session: CallSession) -> ToolResult:
     completion reason, benefits merge) happen here directly on `session`.
     """
     # `call.name` is `ToolName` Literal — registry has every variant by
-    # construction, so the lookup is total. Hallucinated tool names from the
-    # LLM are caught at the client boundary before reaching here.
+    # construction, so the lookup is total.
     set_current_span_name(f"tool_dispatch.{call.name}")
     schema = TOOL_ARG_MODELS[call.name]
     try:

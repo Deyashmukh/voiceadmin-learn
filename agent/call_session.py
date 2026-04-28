@@ -219,7 +219,7 @@ class CallSessionRunner:
         advanced = False
         for call in response.tool_calls:
             # Pair each tool_call with a tool_result entry — even on cancellation
-            # so the history stays well-formed (Groq's tool API rejects mismatched
+            # so the history stays well-formed (tool-calling APIs reject mismatched
             # tool_call / tool_result pairing on the next turn).
             tool_call_turn = Turn(role="tool_call", tool_call=call)
             self.session.history.append(tool_call_turn)

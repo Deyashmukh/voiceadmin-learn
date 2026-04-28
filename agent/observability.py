@@ -7,9 +7,15 @@ Langfuse reads credentials from env vars:
 
 When Langfuse is unavailable (env missing or backend unreachable), every
 helper here is a quiet no-op — the agent runs without traces but doesn't
-fail. The `@observe` decorators on `_run_turn`, `_ivr_turn`, `_rep_turn`,
-the dispatcher, and the LLM clients are likewise no-ops without keys; the
-SDK's `get_client()` returns a stub.
+fail. `@observe` decorators elsewhere are likewise no-ops without keys
+(the SDK's `get_client()` returns a stub).
+
+Known UI quirk: Langfuse's `@observe` records `asyncio.CancelledError` as
+an ERROR-level span. Barge-ins show up as red error traces in the UI even
+though they're a normal re-do, not a failure. The SDK overwrites any
+manual `level=DEFAULT` set inside the wrapped function, so the fix is
+either an upstream change to Langfuse or replacing `@observe` with a
+custom wrapper — deferred.
 """
 
 from __future__ import annotations
@@ -77,10 +83,7 @@ def trace_session(call_sid: str) -> AbstractContextManager[Any]:
 
 
 def set_current_span_name(name: str) -> None:
-    """Rename the active Langfuse span. Used by the tool dispatcher to expand
-    its generic `tool_dispatch` span into `tool_dispatch.<call.name>` so each
-    tool surfaces as its own bucket in the UI rather than collapsing them all.
-    """
+    """Rename the active Langfuse span to `name`. No-op when disabled."""
     if not _LANGFUSE_ENABLED:
         return
     try:

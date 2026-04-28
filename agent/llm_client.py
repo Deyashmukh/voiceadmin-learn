@@ -5,8 +5,7 @@
 persona system prompt is marked with `cache_control: ephemeral` to enable
 prompt caching across rep turns within a call.
 
-`@observe` produces one Langfuse generation span per round-trip, nested
-under the per-turn span declared in `agent/call_session.py`.
+`@observe` produces one Langfuse generation span per round-trip.
 """
 
 from __future__ import annotations
