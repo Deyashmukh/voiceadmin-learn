@@ -89,6 +89,16 @@ def test_dob_prompt_carries_member_id_forward(client: TestClient):
     assert "member_id=123456" in body
 
 
+def test_dob_prompt_redirect_recovers_member_id_from_query(client: TestClient):
+    # No-input timeout: Twilio follows the <Redirect> URL with no Digits in the
+    # form body. The handler must fall back to the query string so the next
+    # prompt doesn't render with an empty member_id.
+    response = client.post("/auth/dob?member_id=123456")
+    body = response.text.lower()
+    assert "date of birth" in body
+    assert "member_id=123456" in body
+
+
 # --- /auth/confirm -------------------------------------------------------
 
 

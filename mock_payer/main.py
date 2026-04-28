@@ -45,8 +45,11 @@ async def auth_member_id() -> Response:
 
 
 @app.post("/auth/dob")
-async def auth_dob(digits: str = _DigitsForm) -> Response:
-    return _twiml(ivr_tree.dob_prompt(member_id=digits))
+async def auth_dob(member_id: str = "", digits: str = _DigitsForm) -> Response:
+    # First arrival: `digits` holds the just-entered member ID from the prior Gather.
+    # No-input redirect: `digits` is empty and `member_id` comes via the query string
+    # so we don't render the next prompt with a blank caller ID.
+    return _twiml(ivr_tree.dob_prompt(member_id=digits or member_id))
 
 
 @app.post("/auth/confirm")
