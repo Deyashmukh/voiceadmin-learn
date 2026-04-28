@@ -56,6 +56,40 @@ class FakeClassifier:
         return self.results.pop(0)
 
 
+@dataclass
+class FakeAnthropicRepClient:
+    """Stand-in for `agent.llm_client.AnthropicRepClient` in offline tests.
+
+    Mirrors `complete_structured(system, history, schema)` shape; pops queued
+    responses in order. Records each call so tests can assert on the rendered
+    prompt / message history."""
+
+    responses: list[BaseModel] = field(default_factory=list)
+    exception: Exception | None = None
+    slow_mode_seconds: float = 0.0
+    calls: list[tuple[str, list[dict[str, object]]]] = field(default_factory=list)
+
+    async def complete_structured[T: BaseModel](
+        self,
+        system: str,
+        history: list[dict[str, object]],
+        schema: type[T],
+        max_tokens: int = 1024,
+    ) -> T:
+        self.calls.append((system, history))
+        if self.slow_mode_seconds:
+            await asyncio.sleep(self.slow_mode_seconds)
+        if self.exception is not None:
+            raise self.exception
+        if not self.responses:
+            raise AssertionError("no responses queued for FakeAnthropicRepClient")
+        response = self.responses.pop(0)
+        assert isinstance(response, schema), (
+            f"queued {type(response).__name__}, asked for {schema.__name__}"
+        )
+        return response
+
+
 @pytest.fixture
 def patient() -> PatientInfo:
     return PatientInfo(
