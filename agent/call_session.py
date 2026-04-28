@@ -5,8 +5,11 @@ latency never blocks the audio loop. `mark_interrupted()` cancels the in-
 flight turn task — actual `asyncio.Task.cancel()`, not a flag check — so the
 LLM `await` raises `CancelledError` and the handler aborts cleanly.
 
-Currently routes all turns to `_ivr_turn`; mode-aware dispatch and rep mode
-are added in later milestones.
+Two modes, dispatched per turn from `session.mode`:
+- `ivr` → `_ivr_turn` runs an LLM-with-tools loop (Llama 4 Scout)
+- `rep` → `_rep_turn` runs a structured-output LLM (Claude Haiku 4.5)
+
+Mode flips one-way `ivr → rep` via the `transfer_to_rep` tool call.
 """
 
 from __future__ import annotations
@@ -16,12 +19,15 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 import structlog
+from pydantic import BaseModel
 
 from agent.actuator import Actuator, CallActuator
 from agent.logging_config import log
 from agent.schemas import (
     CallSession,
     IVRTurnResponse,
+    RepTurnOutput,
+    SpeakIntent,
     ToolCall,
     ToolResult,
     Turn,
@@ -32,6 +38,8 @@ QUEUE_MAX = 8
 # from `llm_aborted_ivr` (LLM-deliberate) — this is the "the LLM is spinning
 # on validator rejections or producing no tool calls at all" case.
 IVR_NO_PROGRESS_LIMIT = 2
+# After 2 consecutive rep turns where the LLM emits phase="stuck", terminate.
+REP_STUCK_LIMIT = 2
 
 
 class IVRLLMClient(Protocol):
@@ -49,6 +57,19 @@ class IVRLLMClient(Protocol):
     ) -> IVRTurnResponse: ...
 
 
+class RepLLMClient(Protocol):
+    """Structured-output LLM for rep mode. Production: `AnthropicRepClient`.
+    Tests inject `FakeAnthropicRepClient`."""
+
+    async def complete_structured[T: BaseModel](
+        self,
+        system: str,
+        history: list[dict[str, Any]],
+        schema: type[T],
+        max_tokens: int = 1024,
+    ) -> T: ...
+
+
 # Type alias for the dispatcher callable so callers can inject `agent.tools.dispatch`
 # directly or pass a wrapper for testing.
 ToolDispatcher = Callable[[ToolCall, CallSession], Awaitable[ToolResult]]
@@ -62,8 +83,10 @@ class CallSessionRunner:
         self,
         session: CallSession,
         ivr_llm: IVRLLMClient,
+        rep_llm: RepLLMClient,
         tool_dispatcher: ToolDispatcher,
         ivr_system_prompt: str,
+        rep_system_prompt: str,
         tools: list[dict[str, Any]],
         *,
         actuator: Actuator | None = None,
@@ -73,8 +96,10 @@ class CallSessionRunner:
     ) -> None:
         self.session = session
         self.ivr_llm = ivr_llm
+        self.rep_llm = rep_llm
         self.dispatch = tool_dispatcher
         self.ivr_system_prompt = ivr_system_prompt
+        self.rep_system_prompt = rep_system_prompt
         self.tools = tools
         self.in_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=in_queue_size)
         self.out_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=out_queue_size)
@@ -173,7 +198,10 @@ class CallSessionRunner:
         # If the turn is cancelled mid-flight (barge-in), turn_count is NOT
         # incremented and the watchdog counter is NOT touched — barge-in is
         # a re-do, not a "tried and failed" turn.
-        await self._ivr_turn()
+        if self.session.mode == "rep":
+            await self._rep_turn()
+        else:
+            await self._ivr_turn()
         self.session.turn_count += 1
 
     async def _ivr_turn(self) -> None:
@@ -218,6 +246,43 @@ class CallSessionRunner:
         else:
             self.session.ivr_no_progress_turns = 0
 
+    async def _rep_turn(self) -> None:
+        # Slice history starting at the mode-flip point so the rep LLM doesn't
+        # receive the IVR phase's user transcripts (which would arrive as
+        # consecutive user messages — Anthropic 400s on that). When the test
+        # harness sets `mode="rep"` directly, `rep_mode_index` is None and we
+        # send the full (typically empty or test-shaped) history. `is None`
+        # rather than `or 0` because index 0 is a legitimate value (flip at
+        # an empty history) that `or` would silently collapse.
+        start = 0 if self.session.rep_mode_index is None else self.session.rep_mode_index
+        output = await self.rep_llm.complete_structured(
+            system=self.rep_system_prompt,
+            history=_history_to_anthropic_messages(self.session.history[start:]),
+            schema=RepTurnOutput,
+        )
+        # Non-None merge into session.benefits — the LLM emits only the fields
+        # learned from THIS rep utterance; previously-extracted fields stay.
+        # Conflicts surface naturally on the next turn as the LLM's own
+        # follow-up question.
+        for field, value in output.extracted.model_dump(exclude_none=True).items():
+            setattr(self.session.benefits, field, value)
+        # Empty `reply` = stay silent (e.g., during a hold announcement).
+        if output.reply:
+            await self.actuator.execute(SpeakIntent(text=output.reply))
+        self.session.history.append(
+            Turn(role="assistant", content=output.reply, extracted=output.extracted)
+        )
+        if output.phase == "complete":
+            self.session.completion_reason = "rep_complete"
+            log.info("rep_complete", reasoning=output.reasoning)
+        elif output.phase == "stuck":
+            self.session.stuck_turns += 1
+            if self.session.stuck_turns >= REP_STUCK_LIMIT:
+                self.session.completion_reason = "rep_stuck"
+                log.info("rep_stuck_watchdog_tripped")
+        else:
+            self.session.stuck_turns = 0
+
     def _on_consumer_done(self, task: asyncio.Task[None]) -> None:
         """If the consumer dies with an unhandled exception, the pipeline keeps
         awaiting `out_queue` forever. Set a completion reason so the
@@ -230,3 +295,17 @@ class CallSessionRunner:
         log.error("call_session_consumer_died", error=str(exc))
         if self.session.completion_reason is None:
             self.session.completion_reason = "consumer_died"
+
+
+def _history_to_anthropic_messages(history: list[Turn]) -> list[dict[str, Any]]:
+    """Project session history into the Anthropic messages shape — only
+    `user` and `assistant` turns, no tool calls (the rep LLM doesn't run
+    tools). Empty assistant content is skipped so we don't emit hold-music
+    silence as visible turns."""
+    messages: list[dict[str, Any]] = []
+    for turn in history:
+        if turn.role == "user" and turn.content:
+            messages.append({"role": "user", "content": turn.content})
+        elif turn.role == "assistant" and turn.content:
+            messages.append({"role": "assistant", "content": turn.content})
+    return messages

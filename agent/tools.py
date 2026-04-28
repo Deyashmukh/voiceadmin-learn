@@ -169,6 +169,11 @@ def _type_mismatch_msg(field: str, expected_type: type, value: object) -> str:
 
 def _dispatch_transfer_to_rep(session: CallSession) -> ToolResult:
     session.mode = "rep"
+    # Record the history offset at which the rep conversation begins so the
+    # rep LLM doesn't receive IVR-phase user transcripts (which would arrive
+    # as consecutive same-role messages — Anthropic 400s on those).
+    if session.rep_mode_index is None:
+        session.rep_mode_index = len(session.history)
     return ToolResult(
         success=True,
         advanced_call_state=True,

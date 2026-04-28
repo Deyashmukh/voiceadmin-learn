@@ -220,6 +220,12 @@ class CallSession:
     # structural `completion_reason` Literal can't capture the LLM's text.
     # Surfaced in logs and Langfuse traces; not consumed by control flow.
     completion_note: str | None = None
+    # Set by `transfer_to_rep` to `len(history)` at the moment of flip, so the
+    # rep LLM only sees post-flip history. Without this, the IVR phase's user
+    # transcripts would arrive at the rep LLM as consecutive user messages —
+    # Anthropic's API rejects messages that don't start with a user role or
+    # have consecutive same-role entries.
+    rep_mode_index: int | None = None
 
     @property
     def done(self) -> bool:
