@@ -260,22 +260,22 @@ If a hold *announcement* gets transcribed (e.g., *"please continue to hold"*), i
 
 ### New milestones
 
-7. **M5'/A — Schemas.** New types in `agent/schemas.py`: `CallSession`, `Turn`, `RepTurnOutput`, tool-arg models. Retire `ClassifierResult`, `IVRClassifier` Protocol.
+7. **M5'/A — Schemas.** New types in `agent/schemas.py`: `CallSession`, `Turn`, `RepTurnOutput`, tool-arg models. Retire `ClassifierResult`, `IVRClassifier` Protocol. **Relax `Benefits.active: bool` to `bool | None = None`** so partial extraction in rep mode (where the field hasn't been heard yet) is representable — currently `active` is required, which would force every interim merge to fail validation.
 
-8. **M5'/B — Tools layer.** `agent/tools.py`: registry of IVR tools as Pydantic models, dispatcher with per-tool validators. Pure functions; tool dispatch returns intents that the actuator executes.
+8. **M5'/B — Tools layer + DTMF actuator helper.** `agent/tools.py`: registry of IVR tools as Pydantic models, dispatcher with per-tool validators. Pure functions; tool dispatch returns `ToolResult` plus an optional `SideEffectIntent` (DTMF / Speak / Hangup) that the actuator executes. Also build `agent/telephony/dtmf.py`: thin wrapper around `twilio_client.calls(sid).update(twiml="<Response><Play digits=\"...\"/></Response>")` for mid-Media-Stream DTMF injection. Twilio's REST `<Play digits>` mid-call is the documented path; the dialer's existing allowlist doesn't apply (call already exists). Unit-test the dispatcher's validators in M5'/G; the dtmf helper proves itself in M6'.
 
-9. **M5'/C — Anthropic SDK + rep LLM client.** Pin `anthropic` in `pyproject.toml`. Extend `agent/llm_client.py` with a Claude Haiku 4.5 backend implementing `LLMClient.complete_structured` bound to `RepTurnOutput`. Prompt-cache the persona system prompt.
+9. **M5'/C — Anthropic SDK + rep LLM client.** Pin `anthropic` in `pyproject.toml`. Extend `agent/llm_client.py` with a Claude Haiku 4.5 backend that exposes `complete_structured(system, history, schema=RepTurnOutput)`. Implementation note: Anthropic's SDK has no literal `complete_structured` primitive — wrap `messages.create(tools=[<one tool>], tool_choice={"type":"tool","name":"emit_rep_turn"})` where the single tool's input schema is `RepTurnOutput.model_json_schema()`, then `RepTurnOutput.model_validate(response.content[0].input)`. Prompt-cache the persona system prompt; verification asserts `cache_creation_input_tokens > 0` on call 1 and `cache_read_input_tokens > 0` on call 2.
 
 10. **M5'/D — CallSession (split into 3 commits).**
-    - **D1**: scaffolding + IVR-only loop (mode hardcoded "ivr", watchdog).
+    - **D1**: scaffolding + IVR-only loop (mode hardcoded "ivr", watchdog). **Pipecat wiring**: actuator pushes spoken text into `session.out_queue` (the existing `state_processor` pump → `TextFrame` → Cartesia path is unchanged). Avoids coupling actuator to the FrameProcessor. **Carry forward the M4 `mark_interrupted` behavior**: drain `out_queue` *before* cancelling `_current_turn` so a turn that finished moments before barge-in doesn't still get spoken.
     - **D2**: rep-mode handler with structured output (mode hardcoded "rep").
     - **D3**: mode-aware routing + `transfer_to_rep` wiring (the flip).
 
-11. **M5'/E — Retire LangGraph + classifier.** Remove `langgraph`, `langchain` from deps. Delete `agent/graph.py`, `agent/graph_runner.py`, `agent/classifier.py`. Delete corresponding tests. Update `agent/processors/state_processor.py` to wire `CallSession` instead of `GraphRunner`.
+11. **M5'/E — Retire LangGraph + classifier.** Remove `langgraph`, `langchain` from deps. Delete `agent/graph.py`, `agent/graph_runner.py`, `agent/classifier.py`. Delete corresponding tests. **Order matters**: this milestone runs *after* M5'/D3 lands AND after `agent/main.py` has been rewritten to construct a `CallSession` instead of a `GraphRunner` — `main.py` currently imports all three retiring modules, so deleting them earlier breaks the entrypoint. Update `agent/processors/state_processor.py` to wire `CallSession`'s queue interface (identical to `GraphRunner` — `submit_transcript`, `start`/`stop`, `mark_interrupted`, `out_queue` — so the change is largely a symbol swap).
 
-12. **M5'/F — Observability rebuild.** `agent/observability.py` rewritten to use Langfuse `@observe` decorators on the per-turn function, both LLM call sites, each tool dispatcher. Set `langfuse_session_id` via `update_current_trace`.
+12. **M5'/F — Observability rebuild.** `agent/observability.py` rewritten to use Langfuse `@observe` decorators on the per-turn function, both LLM call sites (IVR + rep), each tool dispatcher. Set `langfuse_session_id` via `update_current_trace`. Verification asserts the trace tree shows correct **span nesting** (per-turn span contains LLM-call spans contains tool-dispatch spans), not just span existence — `@observe` context across `asyncio.to_thread` worked in M4 via `get_client()` re-fetch; the same trick is needed for the Anthropic SDK call wrapper.
 
-13. **M5'/G — Tests.** `tests/unit/test_call_session.py`, `tests/unit/test_tools.py`. New fakes for Anthropic + Groq tool clients. Zero network.
+13. **M5'/G — Tests.** `tests/unit/test_call_session.py`, `tests/unit/test_tools.py`. New fakes for Anthropic + Groq tool clients. Zero network. Cover specifically: `ivr_no_progress` watchdog increments on a turn where the LLM produced *zero* tool calls (Groq timeout case) — easy to miss, easy to over-count.
 
 14. **M6' — DTMF spike.** ~10 minutes once M5'/D lands. Place a call to your cell, drive the IVR LLM through one menu via your voice ("press 1 for eligibility"), confirm sendDigits tones audible on your cell. Document in `NOTES.md`.
 
@@ -305,13 +305,12 @@ voiceadmin-learn/
 │   │   └── state_processor.py        # Pipecat adapter; queues to/from CallSession
 │   ├── telephony/
 │   │   ├── dialer.py                 # unchanged
-│   │   └── dtmf.py                   # send_digits actuator
+│   │   └── dtmf.py                   # NEW: Twilio REST mid-stream sendDigits wrapper (Calls(sid).update)
 │   ├── actuator.py                   # NEW: executes IVR side-effect intents (DTMF, TTS, hangup)
 │   ├── prompts/
 │   │   ├── ivr_system.v1.txt         # NEW: IVR mode system prompt
 │   │   └── rep_turn.v1.txt           # NEW: rep mode persona prompt
 │   ├── logging_config.py             # unchanged
-│   ├── config.py                     # unchanged
 │   └── schemas.py                    # CallSession, Turn, RepTurnOutput, tool-arg models; ClassifierResult OUT
 ├── mock_payer/                       # learning artifact, no longer wired
 │   ├── main.py
@@ -331,10 +330,10 @@ voiceadmin-learn/
 
 - **M5'/A:** `pytest tests/unit/test_schemas.py` passes; new types instantiate; tool-arg validators reject malformed input.
 - **M5'/B:** `pytest tests/unit/test_tools.py` passes; every validator hit on happy + invalid path; dispatcher returns tool-error messages on rejection.
-- **M5'/C:** Anthropic Haiku 4.5 client reaches a real Anthropic endpoint in a manual REPL check; structured-output bound to `RepTurnOutput` parses cleanly. Prompt-caching hit rate >0% on second call.
-- **M5'/D:** `pytest tests/unit/test_call_session.py` passes; cancellation test (slow-LLM barge-in) cancels within 150ms; watchdogs trigger on no-progress and stuck cases.
-- **M5'/E:** `pyproject.toml` no longer mentions `langgraph` or `langchain`. `agent/graph*.py` and `agent/classifier.py` deleted. Full unit suite green.
-- **M5'/F:** Langfuse UI shows trace tree with one session per call; nested spans for each LLM call and each tool dispatch.
+- **M5'/C:** Anthropic Haiku 4.5 client reaches a real Anthropic endpoint in a manual REPL check; structured-output bound to `RepTurnOutput` parses cleanly. Prompt-cache assertions: `cache_creation_input_tokens > 0` on call 1, `cache_read_input_tokens > 0` on call 2.
+- **M5'/D:** `pytest tests/unit/test_call_session.py` passes; cancellation test (slow-LLM barge-in) cancels within 150ms; `out_queue` is drained on `mark_interrupted` (regression for the M4 post-review fix); watchdogs trigger on no-progress and stuck cases.
+- **M5'/E:** `pyproject.toml` no longer mentions `langgraph` or `langchain`. `agent/graph*.py` and `agent/classifier.py` deleted. `agent/main.py` constructs `CallSession`, not `GraphRunner`. Full unit suite green. `mock_payer/` still type-checks under pyright (it stays in the `include` path as a learning artifact).
+- **M5'/F:** Langfuse UI shows trace tree with one session per call; spans nest correctly (per-turn → LLM-call → tool-dispatch), not just spans existing in isolation.
 - **M6':** DTMF tones audible on user's cell during a live Media Streams call. Logged in `NOTES.md`.
 - **M7':** 5/5 happy-path runs land complete `Benefits`. Per-call total token budget under ~30k (sum across IVR + rep LLMs). Each run has a Langfuse trace.
 - **M7'+:** Each deviation passes 5/5 runs. Logs show the rep LLM's reasoning fields explaining the chosen behavior.
