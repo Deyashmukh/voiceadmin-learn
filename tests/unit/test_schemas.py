@@ -302,6 +302,7 @@ def test_call_session_defaults(patient: PatientInfo):
     assert s.stuck_turns == 0
     assert s.done is False
     assert s.completion_reason is None
+    assert s.completion_note is None
 
 
 def test_call_session_history_is_per_instance(patient: PatientInfo):
