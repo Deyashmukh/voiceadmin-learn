@@ -8,7 +8,15 @@ from dataclasses import dataclass, field
 import pytest
 from pydantic import BaseModel
 
-from agent.schemas import Benefits, CallSession, ClassifierResult, PatientInfo
+from agent.schemas import (
+    Benefits,
+    CallSession,
+    ClassifierResult,
+    IVRTurnResponse,
+    PatientInfo,
+    SideEffectIntent,
+    Turn,
+)
 
 
 @dataclass
@@ -88,6 +96,56 @@ class FakeAnthropicRepClient:
             f"queued {type(response).__name__}, asked for {schema.__name__}"
         )
         return response
+
+
+@dataclass
+class FakeIVRLLMClient:
+    """Stand-in for the (yet-to-be-built) tool-calling Groq IVR LLM client.
+
+    Queue `IVRTurnResponse` instances; each call pops one. Records every
+    call so tests can assert on the rendered prompt + history shape that
+    M5'/D's later real-Groq client must match."""
+
+    responses: list[IVRTurnResponse] = field(default_factory=list)
+    exception: Exception | None = None
+    slow_mode_seconds: float = 0.0
+    calls: list[tuple[str, list[Turn], list[dict[str, object]]]] = field(default_factory=list)
+
+    async def complete_with_tools(
+        self,
+        system: str,
+        history: list[Turn],
+        tools: list[dict[str, object]],
+        temperature: float = 0.1,
+    ) -> IVRTurnResponse:
+        # Snapshot the history at call time so the test can see exactly what
+        # the LLM was sent — appending to history happens after this returns.
+        self.calls.append((system, list(history), tools))
+        # Pop the response BEFORE any sleep so a cancellation mid-call burns
+        # the response (matching real-LLM semantics — a cancelled call
+        # doesn't carry its commitment to the next attempt).
+        if self.exception is not None:
+            raise self.exception
+        if not self.responses:
+            raise AssertionError("no responses queued for FakeIVRLLMClient")
+        response = self.responses.pop(0)
+        if self.slow_mode_seconds:
+            await asyncio.sleep(self.slow_mode_seconds)
+        return response
+
+
+@dataclass
+class FakeActuator:
+    """Records every executed `SideEffectIntent`. Tests assert the runner
+    called the actuator with the right intents in the right order."""
+
+    executed: list[SideEffectIntent] = field(default_factory=list)
+    exception: Exception | None = None
+
+    async def execute(self, intent: SideEffectIntent) -> None:
+        self.executed.append(intent)
+        if self.exception is not None:
+            raise self.exception
 
 
 @pytest.fixture

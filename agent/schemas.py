@@ -112,6 +112,16 @@ SideEffectIntent = Annotated[
 ]
 
 
+class IVRTurnResponse(BaseModel):
+    """One IVR LLM round-trip's worth of output. The LLM may emit zero or more
+    tool calls plus optional text (rare in IVR mode, but supported for asides
+    like 'one moment' before a DTMF). Empty `tool_calls` is the watchdog's
+    no-progress signal."""
+
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    text: str = ""
+
+
 class ToolResult(BaseModel):
     """What the dispatcher returns for a single tool call.
 
@@ -174,6 +184,7 @@ CompletionReason = (
         "dtmf_dispatch_failed",
         "asr_lost",
         "transport_closed",
+        "consumer_died",  # consumer task crashed unhandled — safety-net so the pipeline doesn't hang on out_queue
     ]
 )
 
