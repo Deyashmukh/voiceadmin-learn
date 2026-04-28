@@ -1,10 +1,12 @@
 # voiceadmin-learn
 
-Hybrid voice agent (LangGraph state machine + Pipecat audio pipeline + Twilio
+Hybrid voice agent (two-mode `CallSession` + Pipecat audio pipeline + Twilio
 telephony) that automates healthcare eligibility verification calls. A
 learning project, not a production system.
 
-The plan is in `docs/plan.md`. Execution rules are in `CLAUDE.md`.
+The plan is in `docs/plan.md`. Execution rules are in `CLAUDE.md`. Pre-pivot
+LangGraph + regex-classifier architecture lives in PR #4 as a learning
+artifact.
 
 ## Setup
 
@@ -25,7 +27,6 @@ uv run pre-commit install
 
 ```bash
 make agent         # run the voice agent
-make mock-payer    # run the mock payer webhook (FastAPI)
 make test          # unit tests (offline, zero network)
 make lint          # ruff + pyright
 make format        # auto-fix ruff issues
@@ -34,25 +35,24 @@ make format        # auto-fix ruff issues
 ## Layout
 
 ```
-agent/                 # the voice agent
-  main.py              # Pipecat pipeline entrypoint
-  graph.py             # LangGraph StateGraph + handlers + Protocols
-  graph_runner.py      # async task that owns the graph + in/out queues
-  classifier.py        # rule-based IVR keyword classifier
-  llm_client.py        # Groq-backed LLMClient implementation
+agent/                   # the voice agent
+  main.py                # FastAPI + Pipecat pipeline + WSS entrypoint
+  call_session.py        # per-turn loop; mode-aware IVR/rep dispatch
+  tools.py               # IVR tool registry + dispatcher + arg validators
+  actuator.py            # executes side-effect intents (DTMF, TTS, hangup)
+  llm_client.py          # Anthropic rep-mode client (messages.parse)
+  observability.py       # Langfuse @observe wiring + session tagging
+  schemas.py             # CallSession, Turn, RepTurnOutput, tool-arg models
   processors/
-    state_processor.py # thin Pipecat FrameProcessor adapter
+    state_processor.py   # Pipecat FrameProcessor adapter to CallSession
   telephony/
-    dialer.py          # outbound dial + ALLOWED_DESTINATIONS allowlist
-    dtmf.py            # Twilio sendDigits helper
-  prompts/             # versioned prompts
-  logging_config.py    # structlog setup
-  config.py            # typed settings loaded from .env
-  schemas.py           # PatientInfo, Benefits, CallState
-mock_payer/            # FastAPI + TwiML webhook
+    dialer.py            # outbound dial + ALLOWED_DESTINATIONS allowlist
+    dtmf.py              # Twilio mid-stream <Play digits> wrapper
+  prompts/
+    rep_turn.v1.txt      # rep-mode persona prompt
+  logging_config.py      # structlog setup + call_sid contextvar binding
 tests/
-  unit/                # offline, zero network
-  integration/         # mock payer + local Pipecat, no real telephony
+  unit/                  # offline, zero network
 ```
 
 ## Safety
