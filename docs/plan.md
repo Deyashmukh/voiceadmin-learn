@@ -26,7 +26,7 @@ Pivot summary:
 - **No regex classifier.** `agent/classifier.py` retires.
 - **No second Twilio number.** User dials own cell; user is the IVR + rep.
 
-The mock payer (`mock_payer/*` from M5/T3) and the rule-based classifier (`agent/classifier.py` from M5/T4) remain in git history as **learning artifacts** — they document what the regex-based approach looked like, and the contrast against the new architecture is itself the lesson.
+The mock payer (`mock_payer/*` from M5/T3) and the rule-based classifier (`agent/classifier.py` from M5/T4) were deleted from the working tree post-pivot but remain in git history as **learning artifacts** — they document what the regex-based approach looked like, and the contrast against the new architecture is itself the lesson.
 
 ## Stack (April 2026)
 
@@ -312,18 +312,14 @@ voiceadmin-learn/
 │   │   └── rep_turn.v1.txt           # NEW: rep mode persona prompt
 │   ├── logging_config.py             # unchanged
 │   └── schemas.py                    # CallSession, Turn, RepTurnOutput, tool-arg models; ClassifierResult OUT
-├── mock_payer/                       # learning artifact, no longer wired
-│   ├── main.py
-│   └── ivr_tree.py
 └── tests/
-    ├── unit/
-    │   ├── conftest.py               # FakeGroqToolClient, FakeAnthropicClient (replaces FakeLLMClient/FakeClassifier)
-    │   ├── test_call_session.py      # NEW: mode flip, validator retry, merge, termination
-    │   ├── test_tools.py             # NEW: per-validator coverage
-    │   ├── test_state_processor.py   # updated: wires CallSession
-    │   ├── test_dialer.py            # unchanged
-    │   └── test_schemas.py           # unchanged
-    └── integration/                  # M7' phone tests live here as written records
+    └── unit/
+        ├── conftest.py               # FakeGroqToolClient, FakeAnthropicClient (replaces FakeLLMClient/FakeClassifier)
+        ├── test_call_session.py      # NEW: mode flip, validator retry, merge, termination
+        ├── test_tools.py             # NEW: per-validator coverage
+        ├── test_state_processor.py   # updated: wires CallSession
+        ├── test_dialer.py            # unchanged
+        └── test_schemas.py           # unchanged
 ```
 
 ## Verification
@@ -332,7 +328,7 @@ voiceadmin-learn/
 - **M5'/B:** `pytest tests/unit/test_tools.py` passes; every validator hit on happy + invalid path; dispatcher returns tool-error messages on rejection.
 - **M5'/C:** Anthropic Haiku 4.5 client reaches a real Anthropic endpoint in a manual REPL check; `messages.parse(output_format=RepTurnOutput)` returns a validated instance. Cancellation propagation through the SDK await verified offline. Prompt-cache assertion (`cache_creation_input_tokens > 0` / `cache_read_input_tokens > 0`) deferred until the persona prompt grows past Haiku's 4096-token minimum cacheable prefix — current persona is shorter, so the marker is set but caching is a no-op (silently, no error). Re-enable the assertion in M7' if the persona crosses that boundary.
 - **M5'/D:** `pytest tests/unit/test_call_session.py` passes; cancellation test (slow-LLM barge-in) cancels within 150ms; `out_queue` is drained on `mark_interrupted` (regression for the M4 post-review fix); watchdogs trigger on no-progress and stuck cases.
-- **M5'/E:** `pyproject.toml` no longer mentions `langgraph` or `langchain`. `agent/graph*.py` and `agent/classifier.py` deleted. `agent/main.py` constructs `CallSession`, not `GraphRunner`. Full unit suite green. `mock_payer/` still type-checks under pyright (it stays in the `include` path as a learning artifact).
+- **M5'/E:** `pyproject.toml` no longer mentions `langgraph` or `langchain`. `agent/graph*.py` and `agent/classifier.py` deleted. `agent/main.py` constructs `CallSession`, not `GraphRunner`. Full unit suite green. (`mock_payer/` was retained at first then deleted in a follow-up cleanup PR — it survives in git history as a learning artifact.)
 - **M5'/F:** Langfuse UI shows trace tree with one session per call; spans nest correctly (per-turn → LLM-call → tool-dispatch), not just spans existing in isolation.
 - **M6':** DTMF tones audible on user's cell during a live Media Streams call. Logged in `NOTES.md`.
 - **M7':** 5/5 happy-path runs land complete `Benefits`. Per-call total token budget under ~30k (sum across IVR + rep LLMs). Each run has a Langfuse trace.
@@ -341,7 +337,7 @@ voiceadmin-learn/
 
 ## Decisions made during planning (with pivot history)
 
-- **Repo layout:** single repo, `agent/` + `mock_payer/` (latter is learning artifact post-pivot).
+- **Repo layout:** single repo, `agent/` only post-pivot (`mock_payer/` retired and deleted; lives in git history).
 - **Hygiene baseline:** `uv` pinned, `ruff`, `pyright` basic, `pytest`, `pre-commit`. Established M1.
 - **Observability:** Langfuse, self-hosted. Pre-pivot used LangChain callback handler; post-pivot uses `@observe` decorators directly. LangSmith was considered and rejected.
 - **State machine framework:** *Pre-pivot:* LangGraph, runs alongside Pipecat. *Post-pivot:* dropped — the graph was barely using graph features and the new shape has no graph. Replaced with `CallSession` plain-Python loop. Sunk-cost cleared by recognizing the production-shape lesson is more valuable than the LangGraph-internals one.
