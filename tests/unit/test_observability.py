@@ -114,3 +114,61 @@ def test_enrich_current_generation_swallows_sdk_errors(monkeypatch):
         "sys.modules", {"langfuse": MagicMock(get_client=MagicMock(return_value=fake_client))}
     ):
         observability.enrich_current_generation(model="x", usage=None)  # must not raise
+
+
+async def test_flush_langfuse_timeout_is_logged_not_raised(monkeypatch):
+    """If Langfuse is unreachable and flush() blocks past FLUSH_TIMEOUT_S,
+    the helper logs a warning and returns — teardown must not stall."""
+    import asyncio
+
+    def slow_flush() -> None:
+        # to_thread runs this in a worker; sleep longer than the budget so
+        # asyncio.wait_for raises TimeoutError.
+        import time as _time
+
+        _time.sleep(0.2)
+
+    fake_client = MagicMock(flush=slow_flush)
+    monkeypatch.setattr(observability, "_LANGFUSE_ENABLED", True)
+    monkeypatch.setattr(observability, "FLUSH_TIMEOUT_S", 0.05)
+    with patch.dict(
+        "sys.modules", {"langfuse": MagicMock(get_client=MagicMock(return_value=fake_client))}
+    ):
+        # Must not raise TimeoutError or any other exception.
+        await asyncio.wait_for(observability.flush_langfuse(), timeout=2.0)
+
+
+async def test_flush_langfuse_swallows_sdk_errors(monkeypatch):
+    """A misbehaving Langfuse SDK (e.g., a regression that raises during
+    flush) must not take down the call's teardown path."""
+    fake_client = MagicMock()
+    fake_client.flush.side_effect = RuntimeError("simulated")
+    monkeypatch.setattr(observability, "_LANGFUSE_ENABLED", True)
+    with patch.dict(
+        "sys.modules", {"langfuse": MagicMock(get_client=MagicMock(return_value=fake_client))}
+    ):
+        await observability.flush_langfuse()  # must not raise
+
+
+def test_trace_session_handles_import_error(monkeypatch):
+    """If `langfuse` is uninstalled but `_LANGFUSE_ENABLED` is True (stale
+    env or partial install), the helper degrades to nullcontext rather than
+    crashing the call."""
+    monkeypatch.setattr(observability, "_LANGFUSE_ENABLED", True)
+    # `sys.modules[name] = None` makes `import name` raise ImportError.
+    with patch.dict("sys.modules", {"langfuse": None}):
+        cm = observability.trace_session("CA-x")
+    assert isinstance(cm, AbstractContextManager)
+    with cm:
+        pass
+
+
+def test_observability_uses_function_local_imports():
+    """Lock the contract that the disabled-path tests rely on: the helpers
+    must NOT bind `langfuse`, `get_client`, or `propagate_attributes` at
+    module load. If anyone hoists those imports to the top of
+    agent/observability.py, the `patch.dict("sys.modules", ...)` pattern
+    elsewhere in this file silently no-ops, and most disabled-path tests
+    pass vacuously. Catch that here."""
+    assert not hasattr(observability, "get_client")
+    assert not hasattr(observability, "propagate_attributes")
