@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import pytest
 from pydantic import BaseModel
 
-from agent.schemas import Benefits, ClassifierResult, PatientInfo
+from agent.schemas import Benefits, CallSession, ClassifierResult, PatientInfo
 
 
 @dataclass
@@ -85,3 +85,17 @@ def fake_llm() -> FakeLLMClient:
 @pytest.fixture
 def fake_classifier() -> FakeClassifier:
     return FakeClassifier()
+
+
+@pytest.fixture
+def make_session(patient: PatientInfo):
+    """Factory for `CallSession`. Per-test overrides via kwargs:
+    `make_session(mode="rep", recent_menu_options=["1", "2"])`."""
+
+    def _make(**overrides) -> CallSession:
+        s = CallSession(call_sid="CA-test", patient=patient)
+        for key, value in overrides.items():
+            setattr(s, key, value)
+        return s
+
+    return _make

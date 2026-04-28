@@ -48,7 +48,9 @@ CompleteCallReason = Literal["benefits_extracted", "ivr_dead_end", "user_hangup"
 
 
 class SendDTMFArgs(BaseModel):
-    digits: str = Field(min_length=1, max_length=20)
+    # Restrict to the DTMF wire alphabet — `<Play digits>` only accepts these.
+    # Bounds to a real menu's worth of input (member ID + #/*); 20 is generous.
+    digits: str = Field(min_length=1, max_length=20, pattern=r"^[0-9*#]+$")
 
 
 class SpeakArgs(BaseModel):
@@ -163,9 +165,11 @@ CallMode = Literal["ivr", "rep"]
 CompletionReason = (
     CompleteCallReason
     | Literal[
-        "ivr_no_progress",
+        "ivr_no_progress",  # watchdog: 2 IVR turns with no advancing tool call
+        "llm_aborted_ivr",  # LLM emitted fail_with_reason in ivr mode (deliberate abort)
         "rep_complete",
-        "rep_stuck",
+        "rep_stuck",  # watchdog: phase=stuck for 2 consecutive turns
+        "llm_aborted_rep",  # LLM emitted fail_with_reason in rep mode (deliberate abort)
         "tool_dispatch_exception",
         "dtmf_dispatch_failed",
         "asr_lost",
@@ -201,6 +205,10 @@ class CallSession:
     ivr_no_progress_turns: int = 0
     stuck_turns: int = 0
     completion_reason: CompletionReason | None = None
+    # Free-form narrative for `fail_with_reason` and similar paths where the
+    # structural `completion_reason` Literal can't capture the LLM's text.
+    # Surfaced in logs and Langfuse traces; not consumed by control flow.
+    completion_note: str | None = None
 
     @property
     def done(self) -> bool:
