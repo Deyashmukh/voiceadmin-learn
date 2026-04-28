@@ -1,8 +1,8 @@
 # VoiceAdmin Learn — Project Instructions
 
-This is a learning project: a hybrid voice agent (LangGraph state machine + Pipecat audio pipeline + Twilio telephony) that automates healthcare eligibility verification calls. The goal is to internalize how production voice agents are architected, not to ship to production.
+This is a learning project: a hybrid voice agent (two-mode `CallSession` + Pipecat audio pipeline + Twilio telephony) that automates healthcare eligibility verification calls. IVR navigation runs an LLM-with-tools loop; rep conversation runs a structured-output LLM (`RepTurnOutput`). The goal is to internalize how production voice agents are architected, not to ship to production.
 
-Full plan: `docs/plan.md` (copied from `~/.claude/plans/transient-tinkering-pebble.md`).
+Full plan: `docs/plan.md`. Pre-pivot architecture (LangGraph state machine + regex IVR classifier) lives in PR #4 as a learning artifact.
 
 ## Execution rules
 
@@ -13,7 +13,7 @@ These rules apply to every milestone. Violating them is a defect — if you noti
 Independently executable milestones and sub-tasks run in their own git worktree on their own branch. This keeps streams of work from stepping on each other and makes parallelization safe.
 
 - Use the `superpowers:using-git-worktrees` skill to create worktrees. Do not create them ad hoc.
-- Name worktree branches after the milestone or sub-task (e.g., `m2-pipecat-loop`, `m3-graph`, `m5-mock-payer`).
+- Name worktree branches after the milestone or sub-task (e.g., `arch-pivot-plan`, `arch-pivot-tools`, `arch-pivot-call-session`).
 - Merge worktrees back to `main` only after simplify + verify have both passed for that branch.
 
 ### 2. Parallelize aggressively
@@ -71,8 +71,16 @@ One commit per completed milestone or logical sub-task.
 
 ## Architectural non-negotiables
 
-- **LangGraph runs alongside the Pipecat pipeline, never inside a FrameProcessor's `process_frame()`.** Embedding `graph.ainvoke` in the frame path blocks the audio loop and destroys barge-in latency. The `GraphRunner` pattern in the plan is the only acceptable composition.
-- **Interrupts are real `asyncio.Task.cancel()` calls, not flag checks.** Setting `state["interrupted"] = True` does not cancel an in-flight LLM call. Handlers must be cancellation-safe.
+- **`CallSession` runs alongside the Pipecat pipeline, never inside a FrameProcessor's `process_frame()`.** Embedding the LLM call in the frame path blocks the audio loop and destroys barge-in latency. The `CallSession` task-alongside pattern is the only acceptable composition.
+- **Interrupts are real `asyncio.Task.cancel()` calls, not flag checks.** Setting `session.interrupted = True` does not cancel an in-flight LLM call. Handlers must be cancellation-safe.
 - **Bounded queues.** `in_queue` uses drop-oldest on full (stale transcripts are worthless). `out_queue` blocks on full (TTS backpressure is desired).
-- **No checkpointer.** `MemorySaver` is cargo culting for this project. Re-add only if resume-after-crash becomes a real requirement.
-- **One `GraphRunner` per call**, spawned on Pipecat transport-connect, stopped on transport-disconnect. Never process-global.
+- **One `CallSession` per call**, spawned on Pipecat transport-connect, stopped on transport-disconnect. Never process-global.
+- **Determinism is engineered at the tool-dispatch boundary, not assumed from the LLM.** Every IVR tool call has an arg validator; failed validation returns a tool-error message back into history so the LLM can re-pick. No exceptions.
+- **Mode is one-way: `ivr → rep`.** Triggered by the IVR LLM's `transfer_to_rep()` tool call. No reverse path; if a rep puts the agent on hold and an IVR comes back, the agent stays in rep mode (acceptable for learning, flagged for production).
+
+## Things to cut as YAGNI (post-pivot additions)
+
+- LangGraph + LangChain (state-machine framework retired; the new shape is a turn loop with no graph).
+- Regex-based IVR classifier (per-payer rules don't scale; LLM-with-tools handles all payers with one prompt).
+- Mock payer (user roleplays IVR + rep when dialing own cell).
+- Second Twilio number (trial tier handles own-cell dialing).
