@@ -44,6 +44,54 @@ TOOL_ARG_MODELS: dict[ToolName, type[BaseModel]] = {
     "fail_with_reason": FailWithReasonArgs,
 }
 
+# Descriptions surfaced to the IVR LLM via the Groq tool schema. Each one
+# tells the LLM when to pick the tool, not what its args are (the JSON
+# schema covers args). Keep terse — long descriptions waste tokens.
+_TOOL_DESCRIPTIONS: dict[ToolName, str] = {
+    "send_dtmf": ("Press DTMF tones on the live phone call. Use to navigate IVR menus."),
+    "speak": (
+        "Speak a short text aloud over TTS. Use sparingly in IVR mode "
+        "(e.g., 'one moment' before a slow DTMF)."
+    ),
+    "record_benefit": (
+        "Record a benefit field value the IVR (or rep) read aloud. "
+        "Examples: copay=30.0, active=true."
+    ),
+    "transfer_to_rep": (
+        "Mark that the call has been handed off to a human rep. After this, "
+        "the rep-mode LLM takes over. One-way; cannot transfer back to IVR."
+    ),
+    "complete_call": (
+        "End the call cleanly with a structured reason "
+        "(benefits_extracted | ivr_dead_end | user_hangup)."
+    ),
+    "fail_with_reason": (
+        "Abort the call with a free-form reason. Use only when no tool fits "
+        "and the call cannot continue."
+    ),
+}
+
+
+def groq_tool_schemas() -> list[dict[str, object]]:
+    """Build Groq/OpenAI-style function definitions from `TOOL_ARG_MODELS`.
+
+    Each entry surfaces to the IVR LLM as a callable tool with a
+    Pydantic-derived JSON schema for its args. Wired into the runner
+    via `agent.main`'s `groq_tool_schemas()` argument.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": _TOOL_DESCRIPTIONS[name],
+                "parameters": model.model_json_schema(),
+            },
+        }
+        for name, model in TOOL_ARG_MODELS.items()
+    ]
+
+
 # `record_benefit` validates that the value type matches the field's expected
 # type. Pydantic's smart-mode would coerce `False` ↔ `0.0` silently; the test
 # suite locks the distinction in.

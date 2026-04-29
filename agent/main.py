@@ -38,10 +38,10 @@ from twilio.rest import (  # pyright: ignore[reportMissingTypeStubs] (twilio SDK
 
 from agent import tools
 from agent.call_session import CallSessionRunner, IVRLLMClient
-from agent.llm_client import AnthropicRepClient
+from agent.llm_client import AnthropicRepClient, GroqToolCallingClient
 from agent.logging_config import configure_logging, log
 from agent.processors.state_processor import StateMachineProcessor
-from agent.schemas import CallSession, IVRTurnResponse, PatientInfo, Turn
+from agent.schemas import CallSession, PatientInfo
 
 load_dotenv()
 configure_logging()
@@ -79,30 +79,6 @@ def _rep_system_prompt(patient: PatientInfo) -> str:
 @functools.cache
 def _twilio_rest_client() -> TwilioRestClient:
     return TwilioRestClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-
-
-class _UnimplementedIVRClient:
-    """Fail-fast placeholder for the Groq tool-calling IVR client.
-
-    Raises at construction so a misconfigured live deployment dies before
-    audio starts flowing, not several seconds into the call. Replace with
-    a real `IVRLLMClient` implementation before wiring live calls.
-    """
-
-    def __init__(self) -> None:
-        raise NotImplementedError(
-            "IVR tool-calling client is not wired. Replace `_UnimplementedIVRClient()` "
-            "in agent/main.py with a real IVRLLMClient before accepting live calls."
-        )
-
-    async def complete_with_tools(
-        self,
-        system: str,
-        history: list[Turn],
-        tools: list[dict[str, object]],
-        temperature: float = 0.1,
-    ) -> IVRTurnResponse:
-        raise NotImplementedError
 
 
 @app.post("/twiml")
@@ -161,7 +137,7 @@ async def ws(websocket: WebSocket) -> None:
 
     patient = _default_patient()
     session = CallSession(call_sid=call_sid, patient=patient)
-    ivr_llm: IVRLLMClient = _UnimplementedIVRClient()
+    ivr_llm: IVRLLMClient = GroqToolCallingClient()
     rep_llm = AnthropicRepClient()
     runner = CallSessionRunner(
         session=session,
@@ -170,7 +146,7 @@ async def ws(websocket: WebSocket) -> None:
         tool_dispatcher=tools.dispatch,
         ivr_system_prompt=_IVR_SYSTEM_PROMPT,
         rep_system_prompt=_rep_system_prompt(patient),
-        tools=[],
+        tools=tools.groq_tool_schemas(),
         twilio_client=_twilio_rest_client(),
     )
     state_proc = StateMachineProcessor(runner)

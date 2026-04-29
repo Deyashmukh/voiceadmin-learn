@@ -7,8 +7,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent.llm_client import REP_MODEL, AnthropicRepClient
-from agent.schemas import Benefits, RepTurnOutput
+from agent.llm_client import (
+    IVR_MODEL,
+    REP_MODEL,
+    AnthropicRepClient,
+    GroqToolCallingClient,
+    _history_to_groq_messages,  # pyright: ignore[reportPrivateUsage]
+)
+from agent.schemas import Benefits, IVRTurnResponse, RepTurnOutput, ToolCall, Turn
 
 from .conftest import FakeAnthropicRepClient
 
@@ -267,3 +273,195 @@ async def test_fake_slow_mode_delays_response(rep_output: RepTurnOutput):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# --- GroqToolCallingClient tests -------------------------------------------
+
+
+def _patched_groq(
+    message_content: str = "", tool_calls: list[dict[str, object]] | None = None
+) -> tuple[GroqToolCallingClient, AsyncMock]:
+    """Build a GroqToolCallingClient whose AsyncGroq surface returns a mock
+    response shaped like Groq's chat-completion output."""
+    fake_message = MagicMock()
+    fake_message.content = message_content
+    if tool_calls is not None:
+        fake_tcs: list[MagicMock] = []
+        for tc in tool_calls:
+            m = MagicMock()
+            m.id = tc["id"]
+            m.function = MagicMock()
+            m.function.name = tc["name"]
+            m.function.arguments = tc["arguments"]
+            fake_tcs.append(m)
+        fake_message.tool_calls = fake_tcs
+    else:
+        fake_message.tool_calls = None
+    fake_choice = MagicMock(message=fake_message)
+    fake_response = MagicMock(choices=[fake_choice])
+    fake_response.usage = MagicMock(prompt_tokens=10, completion_tokens=20, total_tokens=30)
+    create_mock = AsyncMock(return_value=fake_response)
+    fake_completions = MagicMock(create=create_mock)
+    fake_chat = MagicMock(completions=fake_completions)
+    fake_async = MagicMock(chat=fake_chat)
+    client = GroqToolCallingClient(client=fake_async)
+    return client, create_mock
+
+
+def test_groq_client_requires_api_key(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="GROQ_API_KEY is not set"):
+        GroqToolCallingClient()
+
+
+def test_groq_client_accepts_explicit_key(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    client = GroqToolCallingClient(api_key="gsk-explicit")
+    assert client._client is not None  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_groq_client_returns_parsed_tool_calls():
+    """Happy path: Groq returns tool_calls; client maps them into IVRTurnResponse."""
+    client, _ = _patched_groq(
+        tool_calls=[
+            {"id": "call_1", "name": "send_dtmf", "arguments": '{"digits": "1"}'},
+        ],
+    )
+    result = await client.complete_with_tools(
+        system="x", history=[Turn(role="user", content="hi")], tools=[], temperature=0.1
+    )
+    assert isinstance(result, IVRTurnResponse)
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "send_dtmf"
+    assert result.tool_calls[0].args == {"digits": "1"}
+    assert result.tool_calls[0].id == "call_1"
+
+
+async def test_groq_client_drops_malformed_json_args():
+    """Malformed JSON args from a hallucinating model are dropped silently —
+    the dispatcher would reject them downstream anyway, but filtering here
+    keeps `IVRTurnResponse.tool_calls` clean for the watchdog."""
+    client, _ = _patched_groq(
+        tool_calls=[
+            {"id": "call_1", "name": "send_dtmf", "arguments": "not valid json{"},
+            {"id": "call_2", "name": "speak", "arguments": '{"text": "ok"}'},
+        ],
+    )
+    result = await client.complete_with_tools(system="x", history=[], tools=[])
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "speak"
+
+
+async def test_groq_client_drops_hallucinated_tool_names():
+    """Tool names not in the `ToolName` Literal are dropped at the boundary."""
+    client, _ = _patched_groq(
+        tool_calls=[
+            {"id": "call_1", "name": "made_up_tool", "arguments": "{}"},
+            {"id": "call_2", "name": "complete_call", "arguments": '{"reason": "user_hangup"}'},
+        ],
+    )
+    result = await client.complete_with_tools(system="x", history=[], tools=[])
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "complete_call"
+
+
+async def test_groq_client_returns_text_with_no_tool_calls():
+    """If the LLM only emits text (no tools), `IVRTurnResponse.tool_calls`
+    is empty and `text` carries the content. The watchdog uses empty
+    tool_calls as the no-progress signal."""
+    client, _ = _patched_groq(message_content="thinking...", tool_calls=None)
+    result = await client.complete_with_tools(system="x", history=[], tools=[])
+    assert result.tool_calls == []
+    assert result.text == "thinking..."
+
+
+async def test_groq_client_passes_call_args_to_sdk():
+    """Verify model, tool_choice, temperature, max_tokens reach the SDK."""
+    client, create_mock = _patched_groq()
+    await client.complete_with_tools(system="sys", history=[], tools=[{"x": 1}], temperature=0.2)
+    kwargs = create_mock.call_args.kwargs
+    assert kwargs["model"] == IVR_MODEL
+    assert kwargs["tool_choice"] == "auto"
+    assert kwargs["temperature"] == 0.2
+    assert kwargs["tools"] == [{"x": 1}]
+    assert kwargs["max_tokens"] == 512
+
+
+# --- _history_to_groq_messages tests ---------------------------------------
+
+
+def test_history_to_groq_messages_user_only():
+    msgs = _history_to_groq_messages("sys", [Turn(role="user", content="hi")])
+    assert msgs == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_history_to_groq_messages_pairs_tool_call_with_result():
+    """Consecutive tool_call + tool_result Turns become assistant.tool_calls
+    + tool message with matching tool_call_id."""
+    history = [
+        Turn(role="user", content="hi"),
+        Turn(
+            role="tool_call",
+            tool_call=ToolCall(name="send_dtmf", args={"digits": "1"}, id="call_1"),
+        ),
+        Turn(role="tool_result", content="DTMF 1 dispatched."),
+    ]
+    msgs = _history_to_groq_messages("sys", history)
+    assert msgs[0] == {"role": "system", "content": "sys"}
+    assert msgs[1] == {"role": "user", "content": "hi"}
+    assert msgs[2]["role"] == "assistant"
+    assert msgs[2]["tool_calls"][0]["id"] == "call_1"  # type: ignore[index, call-overload]
+    assert msgs[2]["tool_calls"][0]["function"]["name"] == "send_dtmf"  # type: ignore[index, call-overload]
+    assert msgs[3] == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "DTMF 1 dispatched.",
+    }
+
+
+def test_history_to_groq_messages_synthesizes_id_when_missing():
+    history = [
+        Turn(role="tool_call", tool_call=ToolCall(name="speak", args={"text": "ok"})),
+        Turn(role="tool_result", content="Speaking."),
+    ]
+    msgs = _history_to_groq_messages("sys", history)
+    assert msgs[1]["tool_calls"][0]["id"] == "call_0_speak"  # type: ignore[index, call-overload]
+    assert msgs[2]["tool_call_id"] == "call_0_speak"
+
+
+def test_history_to_groq_messages_skips_unpaired_tool_result():
+    """A tool_result with no preceding tool_call (shouldn't happen, but
+    defensive) is silently skipped — Groq would 400 on it."""
+    msgs = _history_to_groq_messages(
+        "sys",
+        [
+            Turn(role="user", content="hi"),
+            Turn(role="tool_result", content="orphan"),
+        ],
+    )
+    assert msgs == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_history_to_groq_messages_skips_empty_content():
+    msgs = _history_to_groq_messages(
+        "sys",
+        [Turn(role="user", content=""), Turn(role="assistant", content="")],
+    )
+    assert msgs == [{"role": "system", "content": "sys"}]
+
+
+def test_history_to_groq_messages_assistant_text():
+    msgs = _history_to_groq_messages(
+        "sys",
+        [
+            Turn(role="user", content="hi"),
+            Turn(role="assistant", content="hello back"),
+        ],
+    )
+    assert msgs[2] == {"role": "assistant", "content": "hello back"}
