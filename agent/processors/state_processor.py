@@ -9,6 +9,7 @@ LLM work.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 from pipecat.frames.frames import (
@@ -66,10 +67,8 @@ class StateMachineProcessor(FrameProcessor):
     async def _stop(self) -> None:
         if self._pump_task is not None:
             self._pump_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._pump_task
-            except asyncio.CancelledError:
-                pass
             self._pump_task = None
         await self._runner.stop()
         log.info("state_processor_stopped")
@@ -81,7 +80,7 @@ class StateMachineProcessor(FrameProcessor):
                 await self.push_frame(TextFrame(text=response), FrameDirection.DOWNSTREAM)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # If downstream tears down before _stop() runs, push_frame can
                 # raise. Log and keep consuming so the runner isn't back-pressured
                 # on a full out_queue forever.

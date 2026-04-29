@@ -53,10 +53,10 @@ One commit per completed milestone or logical sub-task.
 ## Tooling baseline (established in M1)
 
 - **Dependency manager:** `uv` with pinned exact versions. `uv.lock` is committed.
-- **Lint + format:** `ruff` (both).
-- **Type check:** `pyright` in basic mode (not strict).
+- **Lint + format:** `ruff` (both). `[tool.ruff.lint] select = ["E","F","I","B","UP","N","W","SIM","RUF"]`.
+- **Type check:** `pyright` strict on `agent/` and `tests/` (`[tool.pyright] strict = ["agent","tests"]`).
 - **Tests:** `pytest` + `pytest-asyncio`. Unit tests run offline with zero network calls.
-- **Pre-commit:** `pre-commit` hook runs `ruff` + `pyright` before every commit.
+- **Pre-commit:** `pre-commit` hook runs `ruff` + `pyright` before every commit (developer convenience).
 - **Logging:** `structlog` with `call_sid` and `turn_index` bound as contextvars from M2 onward.
 - **Secrets:** `.env` is gitignored. `.env.example` is checked in with placeholders and comments marking public vs secret keys.
 - **Outbound dial allowlist:** every `calls.create()` passes through a check against the `ALLOWED_DESTINATIONS` env var. Non-negotiable.

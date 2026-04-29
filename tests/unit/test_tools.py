@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -43,7 +44,7 @@ async def test_dispatch_unknown_tool_name_raises_keyerror(make_session: MakeSess
 
     class _ForgedToolCall:
         name = "made_up"
-        args: dict[str, object] = {}
+        args: ClassVar[dict[str, object]] = {}
 
     s = make_session()
     with pytest.raises(KeyError):
