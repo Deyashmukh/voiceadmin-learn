@@ -62,23 +62,18 @@ class IVRCall(NamedTuple):
 
 
 async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
-    """Yield to the event loop until ``predicate`` returns truthy, or fail after
-    a bounded number of iterations.
+    """Yield to the event loop until `predicate()` returns truthy, or fail
+    after a bounded number of iterations.
 
-    Approach (M8'/H — Option B, finite-iteration cap with no wall-clock
-    deadline). The previous implementation polled ``time.monotonic()`` against a
-    deadline and slept 10 ms between checks. Under CPU pressure (e.g. structlog
-    rich-traceback rendering taking >1 s synchronously) the deadline elapsed
-    before the event loop ever resumed our coroutine, producing nondeterministic
-    timeouts. The new helper depends only on event-loop progress: each iteration
-    yields once via ``asyncio.sleep(0.001)``, giving ready tasks (and timer-
-    driven sleeps in fakes such as ``slow_mode_seconds``) a chance to run, then
-    re-checks the predicate. The cap is in iterations, not wall-clock seconds —
-    so a slow scheduler does not cause spurious failures, only a genuinely
-    stuck predicate does. ``timeout`` is retained for signature compatibility
-    and converted to an iteration budget at 1 ms per iteration; tests reading
-    ``timeout=1.0`` still get a ~1 s budget under a healthy loop, but no longer
-    fail when wall-clock advances faster than the loop schedules them.
+    Iteration-cap (not wall-clock deadline) so a slow scheduler doesn't trip
+    spurious timeouts: predicates that depend on cancellation, queue puts, or
+    other event-loop-driven state will see those changes within a few yields
+    regardless of wall-clock pressure. `asyncio.sleep(0.001)` rather than
+    `sleep(0)` because some fakes (`slow_mode_seconds`) advance via real-time
+    timers — `sleep(0)` would starve those timers and never let the predicate
+    flip. Caveat: under sustained event-loop blocking (e.g. a long synchronous
+    call that never yields), iterations stall just as the old wall-clock
+    version did. The change buys variance-immunity, not blocking-immunity.
     """
     # 1 ms per iteration → `timeout` seconds maps to `timeout * 1000` iterations.
     # Floor at 1 to keep `timeout=0` from short-circuiting the first check.
