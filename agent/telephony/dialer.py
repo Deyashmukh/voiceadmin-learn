@@ -10,6 +10,11 @@ import os
 from dataclasses import dataclass
 from typing import Protocol
 
+# Re-exported from agent.errors so existing
+# `from agent.telephony.dialer import DestinationNotAllowedError`
+# imports keep working after the taxonomy unification.
+from agent.errors import DestinationNotAllowedError as DestinationNotAllowedError
+
 
 class _TwilioCallInstance(Protocol):
     """The fields we read on a placed Twilio call. Restricted to `sid` —
@@ -29,10 +34,6 @@ class _TwilioCalls(Protocol):
 
 class TwilioClientLike(Protocol):
     calls: _TwilioCalls
-
-
-class DestinationNotAllowedError(Exception):
-    """Raised when `dial()` is called with a number outside the allowlist."""
 
 
 @dataclass(frozen=True)
