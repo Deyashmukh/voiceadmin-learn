@@ -6,35 +6,43 @@ out_queue natively, so tests can read spoken text from there directly."""
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass
+from typing import NoReturn
 
 import pytest
 import structlog.contextvars
 
 from agent import tools
-from agent.actuator import CallActuator
-from agent.call_session import CallSessionRunner
+from agent.actuator import Actuator, CallActuator
+from agent.call_session import CallSessionRunner, ToolDispatcher
 from agent.schemas import (
     Benefits,
+    CallSession,
     DTMFIntent,
     IVRTurnResponse,
     RepTurnOutput,
     SideEffectIntent,
     SpeakIntent,
     ToolCall,
+    ToolResult,
 )
 
-from .conftest import FakeActuator, FakeAnthropicRepClient, FakeIVRLLMClient
+from .conftest import (
+    FakeActuator,
+    FakeAnthropicRepClient,
+    FakeIVRLLMClient,
+    MakeSession,
+    wait_until,
+)
 
 
 def _build_runner(
-    session,
+    session: CallSession,
     *,
     ivr_llm: FakeIVRLLMClient | None = None,
     rep_llm: FakeAnthropicRepClient | None = None,
-    actuator=None,
-    tool_dispatcher=None,
+    actuator: Actuator | None = None,
+    tool_dispatcher: ToolDispatcher | None = None,
 ) -> tuple[CallSessionRunner, FakeIVRLLMClient, FakeAnthropicRepClient]:
     """Construct a CallSessionRunner with both LLM fakes pre-installed.
     Default actuator is the runner's auto-built `CallActuator` (no
@@ -56,19 +64,10 @@ def _build_runner(
     return runner, ivr, rep
 
 
-async def _wait_until(predicate, timeout: float = 1.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"timed out waiting on {predicate.__name__}")
-
-
 # --- submit_transcript: drop-oldest -----------------------------------------
 
 
-async def test_submit_transcript_drops_oldest_when_full(make_session):
+async def test_submit_transcript_drops_oldest_when_full(make_session: MakeSession):
     runner, _, _ = _build_runner(make_session())
     for i in range(15):
         runner.submit_transcript(f"item-{i}")
@@ -83,7 +82,7 @@ async def test_submit_transcript_drops_oldest_when_full(make_session):
 # --- IVR turn happy path ----------------------------------------------------
 
 
-async def test_ivr_turn_dispatches_send_dtmf_intent(make_session):
+async def test_ivr_turn_dispatches_send_dtmf_intent(make_session: MakeSession):
     """Turn 1 sends DTMF, turn 2 completes the call. Use a FakeActuator so
     we can assert on the intents directly."""
     actuator = FakeActuator()
@@ -98,7 +97,7 @@ async def test_ivr_turn_dispatches_send_dtmf_intent(make_session):
         await runner.start()
         runner.submit_transcript("Press 1 for eligibility")
         runner.submit_transcript("Thank you, that completes the menu")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert any(isinstance(i, DTMFIntent) and i.digits == "1" for i in actuator.executed)
         assert runner.session.completion_reason == "benefits_extracted"
         assert runner.session.done
@@ -106,7 +105,7 @@ async def test_ivr_turn_dispatches_send_dtmf_intent(make_session):
         await runner.stop()
 
 
-async def test_ivr_turn_records_history(make_session):
+async def test_ivr_turn_records_history(make_session: MakeSession):
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "one moment"})]),
@@ -118,7 +117,7 @@ async def test_ivr_turn_records_history(make_session):
         await runner.start()
         runner.submit_transcript("hello")
         runner.submit_transcript("anything")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         roles = [t.role for t in runner.session.history]
         assert roles == [
             "user",
@@ -132,7 +131,7 @@ async def test_ivr_turn_records_history(make_session):
         await runner.stop()
 
 
-async def test_speak_intent_is_pushed_to_out_queue(make_session):
+async def test_speak_intent_is_pushed_to_out_queue(make_session: MakeSession):
     """The default CallActuator routes SpeakIntent.text into out_queue —
     that's the production wire to Cartesia via state_processor."""
     runner, ivr_llm, _rep = _build_runner(make_session())
@@ -151,7 +150,7 @@ async def test_speak_intent_is_pushed_to_out_queue(make_session):
 # --- Validator rejection: re-pick path --------------------------------------
 
 
-async def test_validator_rejection_does_not_advance_call_state(make_session):
+async def test_validator_rejection_does_not_advance_call_state(make_session: MakeSession):
     """Bad DTMF digit (not in recent menu options): dispatcher returns
     `advanced_call_state=False`, so the turn doesn't count as progress and
     the watchdog ticks. Two such turns trip the watchdog."""
@@ -167,7 +166,7 @@ async def test_validator_rejection_does_not_advance_call_state(make_session):
         await runner.start()
         runner.submit_transcript("first")
         runner.submit_transcript("second")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "ivr_no_progress"
         # No DTMF intents reached the actuator (validator rejected both).
         assert not any(isinstance(i, DTMFIntent) for i in actuator.executed)
@@ -178,7 +177,7 @@ async def test_validator_rejection_does_not_advance_call_state(make_session):
 # --- Watchdog: zero-tool-call case (Groq timeout-style) --------------------
 
 
-async def test_watchdog_trips_on_zero_tool_call_turns(make_session):
+async def test_watchdog_trips_on_zero_tool_call_turns(make_session: MakeSession):
     """If the LLM produces no tool calls at all (timeout / hallucinated text
     response with no tools), the watchdog must still tick. Two such turns
     in a row → terminate."""
@@ -188,13 +187,13 @@ async def test_watchdog_trips_on_zero_tool_call_turns(make_session):
         await runner.start()
         runner.submit_transcript("first")
         runner.submit_transcript("second")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "ivr_no_progress"
     finally:
         await runner.stop()
 
 
-async def test_watchdog_resets_on_an_advancing_turn(make_session):
+async def test_watchdog_resets_on_an_advancing_turn(make_session: MakeSession):
     """One bad turn followed by a good turn must reset the counter."""
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
@@ -209,7 +208,7 @@ async def test_watchdog_resets_on_an_advancing_turn(make_session):
         await runner.start()
         for i in range(4):
             runner.submit_transcript(f"transcript-{i}")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "ivr_no_progress"
     finally:
         await runner.stop()
@@ -218,7 +217,7 @@ async def test_watchdog_resets_on_an_advancing_turn(make_session):
 # --- Interrupt: queue drains + task.cancel --------------------------------
 
 
-async def test_mark_interrupted_drains_out_queue(make_session):
+async def test_mark_interrupted_drains_out_queue(make_session: MakeSession):
     """A turn that finished moments before the user started speaking would
     otherwise still get spoken after the barge-in. Drain first."""
     runner, _, _ = _build_runner(make_session())
@@ -228,7 +227,7 @@ async def test_mark_interrupted_drains_out_queue(make_session):
     assert runner.out_queue.empty()
 
 
-async def test_interrupt_drains_in_queue(make_session):
+async def test_interrupt_drains_in_queue(make_session: MakeSession):
     """Barge-in should not let stale queued transcripts feed the next turn."""
     runner, _, _ = _build_runner(make_session())
     runner.submit_transcript("stale-A")
@@ -238,7 +237,7 @@ async def test_interrupt_drains_in_queue(make_session):
     assert runner.in_queue.empty()
 
 
-async def test_mark_interrupted_cancels_in_flight_turn(make_session):
+async def test_mark_interrupted_cancels_in_flight_turn(make_session: MakeSession):
     """A slow LLM call (simulated via slow_mode_seconds) is cancelled cleanly
     by mark_interrupted — the turn task receives CancelledError, the consumer
     catches it, and the loop continues."""
@@ -250,18 +249,18 @@ async def test_mark_interrupted_cancels_in_flight_turn(make_session):
     try:
         await runner.start()
         runner.submit_transcript("kickoff")
-        await _wait_until(
-            lambda: runner._current_turn is not None and not runner._current_turn.done()
+        await wait_until(
+            lambda: runner._current_turn is not None and not runner._current_turn.done()  # pyright: ignore[reportPrivateUsage]
         )
         runner.mark_interrupted()
-        await _wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())
+        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())  # pyright: ignore[reportPrivateUsage]
         # Turn was cancelled → no actuator call happened, no completion set.
         assert runner.session.completion_reason is None
     finally:
         await runner.stop()
 
 
-async def test_mark_interrupted_does_not_complete_call(make_session):
+async def test_mark_interrupted_does_not_complete_call(make_session: MakeSession):
     """Interrupt is a turn-level cancel, not a session-level abort. The runner
     keeps consuming after the interrupt clears."""
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
@@ -275,13 +274,13 @@ async def test_mark_interrupted_does_not_complete_call(make_session):
     try:
         await runner.start()
         runner.submit_transcript("first")
-        await _wait_until(
-            lambda: runner._current_turn is not None and not runner._current_turn.done()
+        await wait_until(
+            lambda: runner._current_turn is not None and not runner._current_turn.done()  # pyright: ignore[reportPrivateUsage]
         )
         runner.mark_interrupted()
         ivr_llm.slow_mode_seconds = 0.0
         runner.submit_transcript("second")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "user_hangup"
     finally:
         await runner.stop()
@@ -290,12 +289,12 @@ async def test_mark_interrupted_does_not_complete_call(make_session):
 # --- Cancellation mid tool-loop preserves history pairing -----------------
 
 
-async def test_cancellation_mid_tool_dispatch_pairs_history(make_session):
+async def test_cancellation_mid_tool_dispatch_pairs_history(make_session: MakeSession):
     """If a turn is cancelled while awaiting tool dispatch, the history must
     still have a `tool_result` paired to the just-appended `tool_call` —
     otherwise Groq's tool API rejects the next turn."""
 
-    async def _slow_dispatcher(call, session):
+    async def _slow_dispatcher(call: ToolCall, session: CallSession) -> ToolResult:
         await asyncio.sleep(5.0)  # cancelled before dispatch finishes
         return await tools.dispatch(call, session)
 
@@ -312,11 +311,11 @@ async def test_cancellation_mid_tool_dispatch_pairs_history(make_session):
     try:
         await runner.start()
         runner.submit_transcript("kickoff")
-        await _wait_until(
-            lambda: runner._current_turn is not None and not runner._current_turn.done()
+        await wait_until(
+            lambda: runner._current_turn is not None and not runner._current_turn.done()  # pyright: ignore[reportPrivateUsage]
         )
         runner.mark_interrupted()
-        await _wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())
+        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())  # pyright: ignore[reportPrivateUsage]
         # History must end with a tool_result paired to the tool_call.
         roles = [t.role for t in session.history]
         # user → tool_call → tool_result(cancelled)
@@ -329,7 +328,7 @@ async def test_cancellation_mid_tool_dispatch_pairs_history(make_session):
 # --- stop() shutdown -------------------------------------------------------
 
 
-async def test_stop_cancels_in_flight_turn_quickly(make_session):
+async def test_stop_cancels_in_flight_turn_quickly(make_session: MakeSession):
     """stop() must complete promptly even when a turn is mid-LLM-call."""
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.slow_mode_seconds = 5.0
@@ -345,7 +344,9 @@ async def test_stop_cancels_in_flight_turn_quickly(make_session):
 # --- Consumer exits cleanly when the call completes ------------------------
 
 
-async def test_consumer_exits_after_complete_call_without_extra_transcript(make_session):
+async def test_consumer_exits_after_complete_call_without_extra_transcript(
+    make_session: MakeSession,
+):
     """When the LLM emits `complete_call`, the consumer must exit the loop
     immediately rather than blocking on `in_queue.get()` waiting for a
     transcript that will never arrive."""
@@ -358,8 +359,8 @@ async def test_consumer_exits_after_complete_call_without_extra_transcript(make_
     await runner.start()
     runner.submit_transcript("Done with menu")
     # Wait for both: session.done AND consumer task itself completes.
-    await _wait_until(lambda: runner.session.done)
-    await _wait_until(lambda: runner._consumer is not None and runner._consumer.done())
+    await wait_until(lambda: runner.session.done)
+    await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
     assert runner.session.completion_reason == "benefits_extracted"
     # Consumer is done — stop() should be a no-op for the consumer task.
     await runner.stop()
@@ -368,12 +369,12 @@ async def test_consumer_exits_after_complete_call_without_extra_transcript(make_
 # --- Consumer-died safety net ---------------------------------------------
 
 
-async def test_consumer_death_sets_completion_reason(make_session):
+async def test_consumer_death_sets_completion_reason(make_session: MakeSession):
     """If the consumer task crashes unhandled, the pipeline-side observer
     needs a signal to end the call instead of hanging on out_queue forever.
     `_on_consumer_done` sets `completion_reason = consumer_died`."""
 
-    async def _exploding_dispatcher(call, session):
+    async def _exploding_dispatcher(call: ToolCall, session: CallSession) -> NoReturn:
         raise RuntimeError("boom")
 
     ivr_llm = FakeIVRLLMClient(
@@ -388,7 +389,7 @@ async def test_consumer_death_sets_completion_reason(make_session):
     try:
         await runner.start()
         runner.submit_transcript("kickoff")
-        await _wait_until(lambda: runner._consumer is not None and runner._consumer.done())
+        await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
         assert runner.session.completion_reason == "consumer_died"
     finally:
         await runner.stop()
@@ -397,7 +398,7 @@ async def test_consumer_death_sets_completion_reason(make_session):
 # --- contextvar binding ----------------------------------------------------
 
 
-async def test_call_sid_bound_in_contextvars_during_turn(make_session):
+async def test_call_sid_bound_in_contextvars_during_turn(make_session: MakeSession):
     """The runner binds `call_sid` and `turn_index` as structlog contextvars
     before kicking off each turn — so any log emission from inside the turn
     (handlers, actuator, dispatcher) carries the call's identity."""
@@ -419,7 +420,7 @@ async def test_call_sid_bound_in_contextvars_during_turn(make_session):
         await runner.start()
         runner.submit_transcript("first")
         runner.submit_transcript("second")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert len(captured) == 2
         assert captured[0]["call_sid"] == runner.session.call_sid
         assert captured[1]["call_sid"] == runner.session.call_sid
@@ -432,7 +433,7 @@ async def test_call_sid_bound_in_contextvars_during_turn(make_session):
 # --- Each queued transcript drives its own turn ----------------------------
 
 
-async def test_each_queued_transcript_drives_its_own_turn(make_session):
+async def test_each_queued_transcript_drives_its_own_turn(make_session: MakeSession):
     """Without barge-in, multiple queued transcripts must each fire a
     distinct turn — distinct user utterances are not collapsed."""
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
@@ -449,7 +450,7 @@ async def test_each_queued_transcript_drives_its_own_turn(make_session):
         runner.submit_transcript("first")
         runner.submit_transcript("second")
         runner.submit_transcript("third")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert len(ivr_llm.calls) == 3
         user_contents = [t.content for t in runner.session.history if t.role == "user"]
         assert user_contents == ["first", "second", "third"]
@@ -460,7 +461,7 @@ async def test_each_queued_transcript_drives_its_own_turn(make_session):
 # --- DTMFIntent without a twilio client raises (CallActuator path) --------
 
 
-async def test_call_actuator_without_twilio_client_rejects_dtmf(make_session):
+async def test_call_actuator_without_twilio_client_rejects_dtmf(make_session: MakeSession):
     """The default CallActuator raises if asked to dispatch DTMF without a
     Twilio client. Locks the precondition for live-call wiring."""
     session = make_session()
@@ -473,7 +474,7 @@ async def test_call_actuator_without_twilio_client_rejects_dtmf(make_session):
 # --- Rep-mode turn handler (D2) -------------------------------------------
 
 
-async def test_rep_turn_speaks_reply_and_merges_partial_benefits(make_session):
+async def test_rep_turn_speaks_reply_and_merges_partial_benefits(make_session: MakeSession):
     """Happy path: rep LLM returns reply + a partial Benefits extraction.
     The reply is spoken via SpeakIntent; non-None Benefits fields are merged
     into session.benefits while None fields are preserved (no overwrite)."""
@@ -495,7 +496,7 @@ async def test_rep_turn_speaks_reply_and_merges_partial_benefits(make_session):
         await runner.start()
         runner.submit_transcript("Hi, this is Sam.")
         runner.submit_transcript("The deductible remaining is 250.")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         # Two SpeakIntents (one per turn).
         speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
         assert len(speaks) == 2
@@ -511,7 +512,7 @@ async def test_rep_turn_speaks_reply_and_merges_partial_benefits(make_session):
         await runner.stop()
 
 
-async def test_rep_turn_complete_phase_ends_call(make_session):
+async def test_rep_turn_complete_phase_ends_call(make_session: MakeSession):
     runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=FakeActuator())
     rep_llm.responses = [
         RepTurnOutput(
@@ -523,13 +524,13 @@ async def test_rep_turn_complete_phase_ends_call(make_session):
     try:
         await runner.start()
         runner.submit_transcript("Anything else?")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "rep_complete"
     finally:
         await runner.stop()
 
 
-async def test_rep_turn_two_consecutive_stuck_phases_end_call(make_session):
+async def test_rep_turn_two_consecutive_stuck_phases_end_call(make_session: MakeSession):
     """Watchdog: phase='stuck' for 2 consecutive turns terminates with
     rep_stuck. Distinct from llm_aborted_rep (deliberate fail_with_reason
     on the IVR side)."""
@@ -544,14 +545,14 @@ async def test_rep_turn_two_consecutive_stuck_phases_end_call(make_session):
         await runner.start()
         runner.submit_transcript("garbled-1")
         runner.submit_transcript("garbled-2")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "rep_stuck"
         assert runner.session.stuck_turns == 2
     finally:
         await runner.stop()
 
 
-async def test_rep_turn_stuck_counter_resets_on_extracting_turn(make_session):
+async def test_rep_turn_stuck_counter_resets_on_extracting_turn(make_session: MakeSession):
     """A non-stuck turn between two stuck turns resets the counter — only
     consecutive stuck turns count toward the watchdog."""
     runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=FakeActuator())
@@ -569,13 +570,13 @@ async def test_rep_turn_stuck_counter_resets_on_extracting_turn(make_session):
         await runner.start()
         for i in range(4):
             runner.submit_transcript(f"transcript-{i}")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "rep_stuck"
     finally:
         await runner.stop()
 
 
-async def test_rep_turn_empty_reply_does_not_speak(make_session):
+async def test_rep_turn_empty_reply_does_not_speak(make_session: MakeSession):
     """Hold-music / silent-listening case: reply='' → actuator gets no
     SpeakIntent, but the rep turn still records a Turn in history."""
     actuator = FakeActuator()
@@ -592,7 +593,7 @@ async def test_rep_turn_empty_reply_does_not_speak(make_session):
         await runner.start()
         runner.submit_transcript("[hold music transcript]")
         runner.submit_transcript("Final answer.")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
         assert len(speaks) == 1  # only the second turn produced one
         assert speaks[0].text == "That's everything"
@@ -600,7 +601,7 @@ async def test_rep_turn_empty_reply_does_not_speak(make_session):
         await runner.stop()
 
 
-async def test_rep_turn_records_assistant_history_with_extracted(make_session):
+async def test_rep_turn_records_assistant_history_with_extracted(make_session: MakeSession):
     """The runner appends the assistant turn with the partial Benefits
     extraction recorded — useful for trace replay / debugging."""
     runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=FakeActuator())
@@ -609,7 +610,7 @@ async def test_rep_turn_records_assistant_history_with_extracted(make_session):
     try:
         await runner.start()
         runner.submit_transcript("Coverage active, copay 30.")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assistant_turns = [t for t in runner.session.history if t.role == "assistant"]
         assert len(assistant_turns) == 1
         assert assistant_turns[0].content == "Got it."
@@ -619,7 +620,7 @@ async def test_rep_turn_records_assistant_history_with_extracted(make_session):
         await runner.stop()
 
 
-async def test_rep_turn_filters_tool_history_when_calling_llm(make_session):
+async def test_rep_turn_filters_tool_history_when_calling_llm(make_session: MakeSession):
     """Rep mode shouldn't see the IVR phase's tool_call/tool_result entries —
     the rep LLM only handles user/assistant text. With `mode="rep"` set
     directly (no transfer_to_rep flip), `rep_mode_index` is None, so the
@@ -640,7 +641,7 @@ async def test_rep_turn_filters_tool_history_when_calling_llm(make_session):
     try:
         await runner.start()
         runner.submit_transcript("hello, this is sam")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         sent_history = rep_llm.calls[0][1]
         roles = [m["role"] for m in sent_history]
         # tool_call / tool_result filtered out; user + assistant + new user kept.
@@ -649,7 +650,7 @@ async def test_rep_turn_filters_tool_history_when_calling_llm(make_session):
         await runner.stop()
 
 
-async def test_rep_turn_skips_pre_flip_history_after_transfer(make_session):
+async def test_rep_turn_skips_pre_flip_history_after_transfer(make_session: MakeSession):
     """**Regression for the consecutive-user-message Anthropic 400 bug.**
     After transfer_to_rep flips the mode, the rep LLM must NOT see the IVR
     phase's user transcripts — those would arrive as consecutive user
@@ -672,9 +673,9 @@ async def test_rep_turn_skips_pre_flip_history_after_transfer(make_session):
         await runner.start()
         runner.submit_transcript("Press 1 for eligibility")
         runner.submit_transcript("Connecting you to a representative")
-        await _wait_until(lambda: runner.session.mode == "rep")
+        await wait_until(lambda: runner.session.mode == "rep")
         runner.submit_transcript("Hi, this is Sam.")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         # The rep LLM's first call must have received exactly one user
         # message — the rep's greeting — not the two prior IVR transcripts.
         sent_history = rep_llm.calls[0][1]
@@ -688,7 +689,7 @@ async def test_rep_turn_skips_pre_flip_history_after_transfer(make_session):
 # --- Mode-aware routing + transfer_to_rep integration (D3) ----------------
 
 
-async def test_default_mode_is_ivr(make_session):
+async def test_default_mode_is_ivr(make_session: MakeSession):
     """A fresh session starts in IVR mode — `_run_turn` routes to
     `_ivr_turn` until something flips the mode."""
     runner, ivr_llm, rep_llm = _build_runner(make_session(), actuator=FakeActuator())
@@ -698,7 +699,7 @@ async def test_default_mode_is_ivr(make_session):
     try:
         await runner.start()
         runner.submit_transcript("kickoff")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         # IVR LLM was called, rep LLM was not.
         assert len(ivr_llm.calls) == 1
         assert len(rep_llm.calls) == 0
@@ -706,7 +707,7 @@ async def test_default_mode_is_ivr(make_session):
         await runner.stop()
 
 
-async def test_transfer_to_rep_flips_mode_and_next_turn_routes_to_rep(make_session):
+async def test_transfer_to_rep_flips_mode_and_next_turn_routes_to_rep(make_session: MakeSession):
     """Integration: IVR LLM emits transfer_to_rep on turn 1 → mode flips →
     next transcript routes to _rep_turn (the rep LLM gets called)."""
     actuator = FakeActuator()
@@ -725,9 +726,9 @@ async def test_transfer_to_rep_flips_mode_and_next_turn_routes_to_rep(make_sessi
         await runner.start()
         runner.submit_transcript("Connecting you to a representative.")
         # Mode flips during turn 1's tool dispatch.
-        await _wait_until(lambda: runner.session.mode == "rep")
+        await wait_until(lambda: runner.session.mode == "rep")
         runner.submit_transcript("Hi, this is Sam.")
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
         assert runner.session.mode == "rep"
         assert len(ivr_llm.calls) == 1
         assert len(rep_llm.calls) == 1
@@ -739,7 +740,7 @@ async def test_transfer_to_rep_flips_mode_and_next_turn_routes_to_rep(make_sessi
         await runner.stop()
 
 
-async def test_rep_turn_cancellation_propagates_cleanly(make_session):
+async def test_rep_turn_cancellation_propagates_cleanly(make_session: MakeSession):
     """Symmetry with the IVR side: a slow rep LLM call cancelled by
     mark_interrupted raises CancelledError cleanly, the consumer catches it,
     no Benefits merge / history append / phase tick happens."""
@@ -752,11 +753,11 @@ async def test_rep_turn_cancellation_propagates_cleanly(make_session):
     try:
         await runner.start()
         runner.submit_transcript("Hi, this is Sam.")
-        await _wait_until(
-            lambda: runner._current_turn is not None and not runner._current_turn.done()
+        await wait_until(
+            lambda: runner._current_turn is not None and not runner._current_turn.done()  # pyright: ignore[reportPrivateUsage]
         )
         runner.mark_interrupted()
-        await _wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())
+        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())  # pyright: ignore[reportPrivateUsage]
         # Cancelled before the LLM returned → no merge, no assistant Turn, no
         # phase advancement, no completion.
         assert runner.session.benefits.active is None
