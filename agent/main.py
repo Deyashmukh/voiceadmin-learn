@@ -32,7 +32,9 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
-from twilio.rest import Client as TwilioRestClient  # pyright: ignore[reportMissingTypeStubs]
+from twilio.rest import (  # pyright: ignore[reportMissingTypeStubs] (twilio SDK ships no type stubs)
+    Client as TwilioRestClient,
+)
 
 from agent import tools
 from agent.call_session import CallSessionRunner, IVRLLMClient
@@ -191,14 +193,15 @@ async def ws(websocket: WebSocket) -> None:
         ),
     )
 
+    # `event_handler` is dynamic on Pipecat's transport; no type stub exists.
     @transport.event_handler("on_client_disconnected")  # pyright: ignore[reportUnknownMemberType]
     async def on_disconnect(_transport: object, _client: object) -> None:
         log.info("ws_client_disconnected", call_sid=call_sid)
         await task.cancel()
 
-    # The decorator stores `on_disconnect` on `transport` at decoration time
-    # but pyright can't see that and flags `reportUnusedFunction`. A no-op
-    # reference here proves the function is used without a suppression.
+    # Referenced here so pyright's `reportUnusedFunction` (strict mode)
+    # doesn't fire — the decorator returns None, so without this line the
+    # inner `async def` looks orphaned to the type checker.
     _ = on_disconnect
 
     pipeline_runner = PipelineRunner()

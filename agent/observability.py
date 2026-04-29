@@ -55,14 +55,13 @@ __all__ = [
 
 
 def observe(*, name: str | None = None, as_type: ObservationType | None = None) -> Callable[[F], F]:
-    """Typed wrapper around `langfuse.observe` — single-suppression site.
+    """Typed wrapper around `langfuse.observe`.
 
-    The Langfuse SDK has no type stubs. This wrapper owns the one suppression
-    so consumers don't each duplicate `# pyright: ignore`. The return type is
-    `Callable[[F], F]` (decorator-shape preserved). Trade-off: the wrapper
-    intentionally does NOT propagate `as_type` into the wrapped function's
-    type — consumers don't rely on that, and reflecting the SDK's overload
-    set here would re-import the stub gap we're trying to localize."""
+    Returns a `Callable[[F], F]` decorator that preserves the wrapped
+    function's signature. `as_type` is passed through to langfuse at runtime
+    but does NOT propagate into the wrapped function's type — reflecting the
+    SDK's overload set here would re-introduce the stub gap this wrapper
+    exists to contain."""
     return _langfuse_observe(name=name, as_type=as_type)  # pyright: ignore[reportUnknownVariableType]
 
 

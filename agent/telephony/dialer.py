@@ -8,14 +8,23 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
+
+
+class _TwilioCallInstance(Protocol):
+    """The fields we read on a placed Twilio call. Restricted to `sid` —
+    expanding this to mirror Twilio's full `CallInstance` would couple us to
+    SDK internals; pyright will fail if we ever read more without updating
+    here."""
+
+    sid: str
 
 
 class _TwilioCalls(Protocol):
     """Structural shape of the `.calls` resource on a Twilio REST client.
-    Tighter than `Any` for the surface we touch; tests' mocks match structurally."""
+    Test mocks satisfy this without inheriting any Twilio types."""
 
-    def create(self, *, to: str, from_: str, url: str | None) -> Any: ...
+    def create(self, *, to: str, from_: str, url: str | None) -> _TwilioCallInstance: ...
 
 
 class TwilioClientLike(Protocol):
@@ -66,5 +75,5 @@ def dial(
     if twilio_client is None:
         raise RuntimeError("twilio_client must be provided to dial()")
 
-    call: Any = twilio_client.calls.create(to=to, from_=from_, url=url)
-    return DialResult(call_sid=str(call.sid), to=to)
+    call = twilio_client.calls.create(to=to, from_=from_, url=url)
+    return DialResult(call_sid=call.sid, to=to)
