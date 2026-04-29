@@ -1,5 +1,6 @@
-"""Unit tests for M5'/C: Anthropic rep-LLM client + the FakeAnthropicRepClient
-seam. Zero network — the SDK call sites are mocked."""
+"""Unit tests for the Anthropic rep-LLM client + the FakeAnthropicRepClient
+seam, plus the GroqToolCallingClient. Zero network — the SDK call sites
+are mocked."""
 
 from __future__ import annotations
 
@@ -213,8 +214,8 @@ async def test_complete_structured_extracts_usage_from_response(rep_output: RepT
 
 async def test_complete_structured_propagates_cancellation(rep_output: RepTurnOutput):
     """A CancelledError raised on the in-flight SDK call must propagate, not
-    leave the session in a half-mutated state. The IVR/rep turn handlers in
-    M5'/D depend on this for barge-in cancellation to actually abort the LLM."""
+    leave the session in a half-mutated state. The IVR/rep turn handlers
+    depend on this for barge-in cancellation to actually abort the LLM."""
     import asyncio
 
     async def _slow_parse(*_args: object, **_kwargs: object):
@@ -285,7 +286,7 @@ async def test_fake_rejects_schema_mismatch(rep_output: RepTurnOutput):
 
 
 async def test_fake_slow_mode_delays_response(rep_output: RepTurnOutput):
-    """Used by M5'/D1 to simulate a slow LLM for barge-in cancellation tests."""
+    """Used to simulate a slow LLM for barge-in cancellation tests."""
     import asyncio
     import time
 

@@ -213,16 +213,26 @@ class StateMachineProcessor(FrameProcessor):
         log.info("state_processor_stopped")
 
     _PUMP_FAILURE_GIVE_UP = 3
-    """Consecutive `push_frame` failures before we conclude the downstream
-    pipeline is gone and stop trying to deliver TTS responses. A single
+    """Consecutive `push_frame` failures before we stop retrying — a single
     failure can be a transient frame-routing race; three in a row means
-    the transport is torn down and continuing is a silent waste of LLM
-    output."""
+    the transport is torn down and further attempts are a waste of CPU
+    and log volume."""
 
     async def _pump_output(self) -> None:
         consecutive_failures = 0
+        given_up = False
         while True:
             response = await self._runner.out_queue.get()
+            if given_up:
+                # Once we've given up retrying, KEEP draining `out_queue` —
+                # the runner's actuator does a blocking `out_queue.put()`
+                # (intentional TTS backpressure), so a stalled pump would
+                # deadlock the runner once 8 SpeakIntents pile up. Drop the
+                # response on the floor; the user can't hear it anyway.
+                # Actual call termination still relies on transport
+                # disconnect → `runner.stop()`; `pipeline_torn_down` is
+                # only a label on the eventual JSONL deliverable.
+                continue
             try:
                 # `TTSSpeakFrame` (vs raw `TextFrame`) is the explicit
                 # "synthesize this now" signal: it bypasses the TTS service's
@@ -237,10 +247,7 @@ class StateMachineProcessor(FrameProcessor):
             except Exception as exc:
                 # A discarded TTS response is a user-visible defect (the
                 # agent's reply never reaches the caller), not a warning —
-                # log at error level. After `_PUMP_FAILURE_GIVE_UP` in a row
-                # we conclude the pipeline is gone and surface a completion
-                # reason so the call session terminates instead of hanging
-                # silently on out_queue forever.
+                # log at error level.
                 consecutive_failures += 1
                 log.error(
                     "pump_push_failed",
@@ -255,4 +262,4 @@ class StateMachineProcessor(FrameProcessor):
                         "pump_giving_up",
                         consecutive_failures=consecutive_failures,
                     )
-                    return
+                    given_up = True

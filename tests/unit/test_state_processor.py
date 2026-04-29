@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 
 import pytest
+import structlog.testing
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -211,8 +212,7 @@ async def test_late_transcript_after_grace_schedules_fresh_flush(make_session: M
 async def test_flush_preserves_buffer_when_submit_raises(make_session: MakeSession):
     """If `submit_transcript` raises (closed queue, future refactor), the
     buffer must NOT be cleared — submit-then-clear ordering means a raise
-    leaves the data intact for the next flush. Pre-fix, the buffer was
-    cleared first and the data went on the floor.
+    leaves the data intact for the next flush.
 
     Asserts the next successful flush still sees the original transcript.
     """
@@ -399,17 +399,24 @@ async def test_pump_pushes_out_queue_text_downstream_as_tts_speak_frame(
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
 
-async def test_pump_gives_up_after_consecutive_failures_and_marks_session(
+async def test_pump_gives_up_after_consecutive_failures_and_keeps_draining(
     make_session: MakeSession,
 ):
     """If the downstream pipeline is gone (transport torn down), each
     `push_frame` from `_pump_output` raises. After `_PUMP_FAILURE_GIVE_UP`
-    consecutive failures the pump must stop trying and set
-    `completion_reason='pipeline_torn_down'` so the call session terminates
-    instead of consuming `out_queue` forever and discarding every reply.
+    consecutive failures the pump must stop retrying push_frame, log
+    `pump_giving_up`, and label the session with
+    `completion_reason='pipeline_torn_down'` — but it must KEEP draining
+    `out_queue`. The runner's actuator uses blocking `out_queue.put()` for
+    TTS backpressure; a pump that returns would deadlock the runner once
+    8 SpeakIntents accumulate. Actual call termination still flows through
+    transport disconnect.
+
+    Asserts: (a) completion_reason is set, (b) `pump_giving_up` log fires,
+    (c) pump task is NOT done (still draining), (d) a post-give-up enqueue
+    is consumed (proves no deadlock).
     """
     proc, runner, _sink = await _make_processor(make_session)
-    # Capture the original BEFORE the try so the finally always sees it.
     original_push = proc.push_frame
 
     async def always_fail(frame: Frame, direction: FrameDirection) -> None:
@@ -418,18 +425,32 @@ async def test_pump_gives_up_after_consecutive_failures_and_marks_session(
         await original_push(frame, direction)
 
     try:
-        await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
-        # Replace push_frame so every TTSSpeakFrame pump-out raises. After
-        # `_PUMP_FAILURE_GIVE_UP` failures the pump must give up and mark
-        # the session.
-        proc.push_frame = always_fail  # pyright: ignore[reportAttributeAccessIssue]
-        for i in range(StateMachineProcessor._PUMP_FAILURE_GIVE_UP):  # pyright: ignore[reportPrivateUsage]
-            await runner.out_queue.put(f"reply-{i}")
-        await wait_until(
-            lambda: runner.session.completion_reason == "pipeline_torn_down",
-            timeout=2.0,
-        )
+        with structlog.testing.capture_logs() as captured:
+            await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+            proc.push_frame = always_fail  # pyright: ignore[reportAttributeAccessIssue]
+            for i in range(StateMachineProcessor._PUMP_FAILURE_GIVE_UP):  # pyright: ignore[reportPrivateUsage]
+                await runner.out_queue.put(f"reply-{i}")
+            await wait_until(
+                lambda: runner.session.completion_reason == "pipeline_torn_down",
+                timeout=2.0,
+            )
+            # Pump must still be alive — returning would deadlock the runner.
+            assert proc._pump_task is not None and not proc._pump_task.done(), (  # pyright: ignore[reportPrivateUsage]
+                "pump task exited; runner will deadlock on blocking out_queue.put()"
+            )
+            # Post-give-up enqueue must drain (the deadlock-avoidance contract).
+            await runner.out_queue.put("post-give-up")
+            await wait_until(lambda: runner.out_queue.empty(), timeout=2.0)
+            # `pump_giving_up` log fires exactly once (filter event+level so a
+            # rename or severity-downgrade fails the test).
+            give_up_events = [
+                e
+                for e in captured
+                if e.get("event") == "pump_giving_up" and e.get("log_level") == "error"
+            ]
+            assert len(give_up_events) == 1, (
+                f"expected exactly one error-level pump_giving_up event, got {len(give_up_events)}"
+            )
     finally:
-        # Restore so EndFrame-on-the-way-out can flow through.
         proc.push_frame = original_push  # pyright: ignore[reportAttributeAccessIssue]
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)

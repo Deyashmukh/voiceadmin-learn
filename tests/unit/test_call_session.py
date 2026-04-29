@@ -73,14 +73,26 @@ def _build_runner(
 
 async def test_submit_transcript_drops_oldest_when_full(make_session: MakeSession):
     runner, _, _ = _build_runner(make_session())
-    for i in range(15):
-        runner.submit_transcript(f"item-{i}")
+    with structlog.testing.capture_logs() as captured:
+        for i in range(15):
+            runner.submit_transcript(f"item-{i}")
     assert runner.in_queue.qsize() == 8
     drained: list[str] = []
     while not runner.in_queue.empty():
         drained.append(runner.in_queue.get_nowait())
     assert drained[-1] == "item-14"
     assert "item-0" not in drained
+    # Each eviction must surface as a `transcript_dropped_queue_full` warning
+    # (the "agent silently skipped a menu" greppability contract). 15 puts
+    # against an 8-slot queue → 7 evictions.
+    eviction_events = [
+        e
+        for e in captured
+        if e.get("event") == "transcript_dropped_queue_full" and e.get("log_level") == "warning"
+    ]
+    assert len(eviction_events) == 7, (
+        f"expected 7 warning-level transcript_dropped_queue_full events, got {len(eviction_events)}"
+    )
 
 
 # --- IVR turn happy path ----------------------------------------------------
@@ -190,6 +202,57 @@ async def test_jsonl_write_failure_does_not_abort_call(
     )
 
 
+async def test_jsonl_serialize_failure_logs_and_skips_write(
+    make_session: MakeSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """If `json.dumps(record)` raises (e.g. a future model gains a
+    non-serializable field like `datetime`), the serialize-first ordering
+    in `_append_benefits_record` must surface the failure as
+    `benefits_record_serialize_failed` at error level AND skip the file
+    write entirely — no torn JSONL row, no half-written line that breaks
+    every downstream reader.
+
+    Locks the contract for the new serialize-then-write split. A refactor
+    that moves serialization back inline with the write would silently
+    re-introduce torn writes and fail this test.
+    """
+    log_path = tmp_path / "benefits.jsonl"
+    monkeypatch.setenv("BENEFITS_LOG_PATH", str(log_path))
+
+    def _raising_dumps(*_args: object, **_kwargs: object) -> NoReturn:
+        raise TypeError("bad field")
+
+    monkeypatch.setattr("agent.call_session.json.dumps", _raising_dumps)
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+        )
+    ]
+    with structlog.testing.capture_logs() as captured:
+        try:
+            await runner.start()
+            runner.submit_transcript("Thank you, goodbye.")
+            await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+        finally:
+            await runner.stop()
+    assert runner.session.completion_reason == "benefits_extracted"
+    serialize_failed_events = [
+        e
+        for e in captured
+        if e.get("event") == "benefits_record_serialize_failed" and e.get("log_level") == "error"
+    ]
+    assert len(serialize_failed_events) == 1, (
+        f"expected exactly one error-level benefits_record_serialize_failed event, "
+        f"got {len(serialize_failed_events)}"
+    )
+    # The file must NOT exist — serialize-first ordering means we never
+    # opened the file at all on a serialize failure.
+    assert not log_path.exists(), (
+        "log file was created despite serialize failure; serialize-then-write ordering is broken"
+    )
+
+
 async def test_ivr_turn_dispatches_send_dtmf_intent(make_session: MakeSession):
     """Turn 1 sends DTMF, turn 2 completes the call. Use a FakeActuator so
     we can assert on the intents directly."""
@@ -241,7 +304,8 @@ async def test_ivr_turn_records_history(make_session: MakeSession):
 
 async def test_speak_intent_is_pushed_to_out_queue(make_session: MakeSession):
     """The default CallActuator routes SpeakIntent.text into out_queue —
-    that's the production wire to Cartesia via state_processor."""
+    that's the production wire to the configured TTS service via
+    state_processor's pump."""
     runner, ivr_llm, _rep = _build_runner(make_session())
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "hello there"})]),
