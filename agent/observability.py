@@ -87,7 +87,7 @@ async def flush_langfuse() -> None:
         await asyncio.wait_for(asyncio.to_thread(get_client().flush), timeout=FLUSH_TIMEOUT_S)
     except TimeoutError:
         log.warning("langfuse_flush_timeout", timeout_s=FLUSH_TIMEOUT_S)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.warning("langfuse_flush_failed", error=str(exc))
 
 
@@ -99,7 +99,7 @@ def enrich_current_generation(*, model: str, usage: dict[str, Any] | None) -> No
         from langfuse import get_client
 
         get_client().update_current_generation(model=model, usage_details=usage)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.debug("langfuse_enrich_failed", error=str(exc))
 
 
@@ -114,7 +114,7 @@ def trace_session(call_sid: str) -> AbstractContextManager[Any]:
         from langfuse import propagate_attributes
 
         return propagate_attributes(session_id=call_sid)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.debug("langfuse_session_id_failed", error=str(exc))
         return contextlib.nullcontext()
 
@@ -127,5 +127,5 @@ def set_current_span_name(name: str) -> None:
         from langfuse import get_client
 
         get_client().update_current_span(name=name)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.debug("langfuse_span_rename_failed", error=str(exc))

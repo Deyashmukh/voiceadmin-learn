@@ -15,6 +15,7 @@ Mode flips one-way `ivr → rep` via the `transfer_to_rep` tool call.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
@@ -122,10 +123,8 @@ class CallSessionRunner:
         try:
             self.in_queue.put_nowait(text)
         except asyncio.QueueFull:
-            try:
+            with contextlib.suppress(asyncio.QueueEmpty):
                 _ = self.in_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
             self.in_queue.put_nowait(text)
 
     def mark_interrupted(self) -> None:
@@ -160,7 +159,7 @@ class CallSessionRunner:
                 await task
             except asyncio.CancelledError:
                 pass
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # A task that crashed during shutdown is still a real bug.
                 log.warning("task_error_during_stop", task=task.get_name(), error=str(exc))
 
