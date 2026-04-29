@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple, Protocol, TypedDict, Unpack
@@ -63,14 +62,26 @@ class IVRCall(NamedTuple):
 
 
 async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
-    """Poll `predicate` until it returns truthy or `timeout` elapses; raise
-    AssertionError on timeout. Shared between async tests that need to wait
-    on side-effect propagation through queues / consumer tasks."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    """Yield to the event loop until `predicate()` returns truthy, or fail
+    after a bounded number of iterations.
+
+    Iteration-cap (not wall-clock deadline) so a slow scheduler doesn't trip
+    spurious timeouts: predicates that depend on cancellation, queue puts, or
+    other event-loop-driven state will see those changes within a few yields
+    regardless of wall-clock pressure. `asyncio.sleep(0.001)` rather than
+    `sleep(0)` because some fakes (`slow_mode_seconds`) advance via real-time
+    timers — `sleep(0)` would starve those timers and never let the predicate
+    flip. Caveat: under sustained event-loop blocking (e.g. a long synchronous
+    call that never yields), iterations stall just as the old wall-clock
+    version did. The change buys variance-immunity, not blocking-immunity.
+    """
+    # 1 ms per iteration → `timeout` seconds maps to `timeout * 1000` iterations.
+    # Floor at 1 to keep `timeout=0` from short-circuiting the first check.
+    max_iterations = max(1, int(timeout * 1000))
+    for _ in range(max_iterations):
         if predicate():
             return
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.001)
     raise AssertionError(f"timed out waiting on {predicate.__name__}")
 
 
