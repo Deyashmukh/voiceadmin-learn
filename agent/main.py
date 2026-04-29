@@ -6,7 +6,8 @@ Flow per inbound call:
   1. Twilio hits POST /twiml → we reply with <Connect><Stream url=wss://.../ws/>
   2. Twilio opens WSS to /ws → we read the first "start" message to grab
      `streamSid` + `callSid`, then build the transport + pipeline.
-  3. Pipeline = transport.input() → Deepgram STT → StateMachineProcessor → Cartesia TTS → transport.output()
+  3. Pipeline = transport.input() → Silero VADProcessor → Deepgram STT →
+     StateMachineProcessor → ElevenLabs TTS → transport.output()
   4. StateMachineProcessor spawns/stops the CallSessionRunner on StartFrame/EndFrame.
 
 Pair this app with `ngrok http 8000` to expose a public URL to Twilio.

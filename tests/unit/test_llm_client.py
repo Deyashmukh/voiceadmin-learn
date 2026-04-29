@@ -445,15 +445,25 @@ def _groq_client_raising(exc: Exception) -> GroqToolCallingClient:
         ),
         APIConnectionError(request=MagicMock()),
         APITimeoutError(request=MagicMock()),
+        RateLimitError("slow down", response=MagicMock(status_code=429), body={"error": {}}),
+        InternalServerError("groq down", response=MagicMock(status_code=500), body={"error": {}}),
     ],
-    ids=["bad_request", "unprocessable", "connection_error", "timeout"],
+    ids=[
+        "bad_request",
+        "unprocessable",
+        "connection_error",
+        "timeout",
+        "rate_limit",
+        "internal_server",
+    ],
 )
 async def test_groq_client_degrades_provider_errors_to_empty_response(exc: Exception):
-    """Provider-side input rejection or transient network blip must NOT kill
-    the call-session consumer. Returning an empty IVRTurnResponse counts as a
-    no-progress turn — the watchdog handles persistent failure. Locks the
-    consumer-survival contract; a regression that re-raises here would crash
-    a live call mid-turn."""
+    """Provider-side input rejection (4xx tool errors) AND transient provider
+    conditions (rate-limit, 5xx, network blip) must NOT kill the call-session
+    consumer. Returning an empty IVRTurnResponse counts as a no-progress turn —
+    the watchdog handles persistent failure. Locks the consumer-survival
+    contract; a regression that re-raises here would crash a live call
+    mid-turn over a single 429."""
     client = _groq_client_raising(exc)
     result = await client.complete_with_tools(system="x", history=[], tools=[])
     assert result.tool_calls == []
@@ -466,17 +476,16 @@ async def test_groq_client_degrades_provider_errors_to_empty_response(exc: Excep
         AuthenticationError("bad key", response=MagicMock(status_code=401), body={"error": {}}),
         PermissionDeniedError("no perms", response=MagicMock(status_code=403), body={"error": {}}),
         NotFoundError("model gone", response=MagicMock(status_code=404), body={"error": {}}),
-        RateLimitError("slow down", response=MagicMock(status_code=429), body={"error": {}}),
-        InternalServerError("groq down", response=MagicMock(status_code=500), body={"error": {}}),
         TypeError("programmer bug"),
     ],
-    ids=["auth", "permission", "not_found", "rate_limit", "internal_server", "type_error"],
+    ids=["auth", "permission", "not_found", "type_error"],
 )
 async def test_groq_client_propagates_misconfig_and_real_bugs(exc: Exception):
-    """Auth / permission / rate-limit / not-found / 5xx / programmer bugs
-    must propagate so misconfigs and regressions surface immediately
-    instead of looking like a confused LLM that the watchdog terminates
-    after wasting two turns."""
+    """Genuine misconfigs (bad key, wrong workspace, retired model id) and
+    non-`APIError` exceptions (programmer bugs, schema drift) must propagate
+    so they surface immediately instead of being masked by the watchdog
+    after two wasted turns. Transient conditions (rate-limit, 5xx, timeout)
+    are NOT in this list — see the degrade test."""
     client = _groq_client_raising(exc)
     with pytest.raises(type(exc)):
         await client.complete_with_tools(system="x", history=[], tools=[])

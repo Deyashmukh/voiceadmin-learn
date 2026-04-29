@@ -12,11 +12,11 @@ from typing import Any, cast, get_args
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
 from groq import (
-    APIConnectionError,
-    APITimeoutError,
+    APIError,
     AsyncGroq,
-    BadRequestError,
-    UnprocessableEntityError,
+    AuthenticationError,
+    NotFoundError,
+    PermissionDeniedError,
 )
 from pydantic import BaseModel, ValidationError
 
@@ -175,21 +175,26 @@ class GroqToolCallingClient:
                 temperature=temperature,
                 max_tokens=512,
             )
-        except (
-            BadRequestError,
-            UnprocessableEntityError,
-            APIConnectionError,
-            APITimeoutError,
-        ) as exc:
-            # Provider-side input rejection (e.g. `tool_use_failed` for
-            # un-classifiable input) or transient network blip — don't kill
-            # the consumer. Empty response counts as a no-progress turn;
-            # two in a row trips the watchdog. AuthenticationError /
-            # PermissionDeniedError / RateLimitError / NotFoundError /
-            # InternalServerError plus any non-Groq exception (programmer
-            # bugs, schema drift) intentionally propagate so misconfigs
-            # surface immediately instead of looking like a confused LLM.
-            log.warning("ivr_llm_call_failed", error=str(exc)[:1500])
+        except (AuthenticationError, PermissionDeniedError, NotFoundError):
+            # Genuine misconfig (bad key, wrong workspace, retired model id) —
+            # propagate so the call dies loudly instead of looking like a
+            # confused LLM. Every retry would fail the same way.
+            raise
+        except APIError as exc:
+            # Everything else from the Groq SDK is either input-rejection
+            # (`tool_use_failed`, schema mismatch) or a transient provider
+            # condition (429, 5xx, connection blip, timeout). None of these
+            # should kill the consumer mid-call: empty response counts as a
+            # no-progress turn, and two in a row trips the watchdog.
+            # Non-`APIError` exceptions (programmer bugs, schema drift)
+            # propagate intentionally so they surface in CI / Langfuse
+            # rather than looking like LLM weirdness.
+            log.warning(
+                "ivr_llm_call_failed",
+                error_class=type(exc).__name__,
+                status_code=getattr(exc, "status_code", None),
+                error=str(exc)[:1500],
+            )
             return IVRTurnResponse(tool_calls=[], text="")
         choice = response.choices[0]
         msg = choice.message
