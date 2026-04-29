@@ -191,6 +191,7 @@ CompletionReason = (
         "asr_lost",
         "transport_closed",
         "consumer_died",  # consumer task crashed unhandled — safety-net so the pipeline doesn't hang on out_queue
+        "pipeline_torn_down",  # downstream push_frame failed N consecutive times — transport is gone
     ]
 )
 

@@ -208,6 +208,47 @@ async def test_late_transcript_after_grace_schedules_fresh_flush(make_session: M
     assert runner.in_queue.get_nowait() == "late text"
 
 
+async def test_flush_preserves_buffer_when_submit_raises(make_session: MakeSession):
+    """If `submit_transcript` raises (closed queue, future refactor), the
+    buffer must NOT be cleared — submit-then-clear ordering means a raise
+    leaves the data intact for the next flush. Pre-fix, the buffer was
+    cleared first and the data went on the floor.
+
+    Asserts the next successful flush still sees the original transcript.
+    """
+    proc, runner, _ = await _make_processor(make_session, vad_stopped_grace_s=0.05)
+    # First flush: monkey-patch submit_transcript to raise.
+    original_submit = runner.submit_transcript
+
+    def submit_then_fail(text: str) -> None:
+        raise RuntimeError("simulated queue failure")
+
+    runner.submit_transcript = submit_then_fail  # pyright: ignore[reportAttributeAccessIssue]
+
+    await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(_transcription("Press 1 for benefits."), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    # Wait for the flush task to actually run (and raise into the asyncio
+    # task — that's the bug we're proving doesn't lose data).
+    await wait_until(
+        lambda: proc._flush_task is None,  # pyright: ignore[reportPrivateUsage]
+        timeout=2.0,
+    )
+    # Buffer must still hold the unsubmitted text.
+    assert proc._transcript_buffer == ["Press 1 for benefits."]  # pyright: ignore[reportPrivateUsage]
+
+    # Restore submit_transcript so the next flush succeeds. Add a fresh
+    # transcript and trigger another stop — the original text should be
+    # part of the eventual submission.
+    runner.submit_transcript = original_submit  # pyright: ignore[reportAttributeAccessIssue]
+    await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(_transcription("Press 9 for a rep."), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await wait_until(lambda: not runner.in_queue.empty(), timeout=5.0)
+    combined = runner.in_queue.get_nowait()
+    assert combined == "Press 1 for benefits. Press 9 for a rep."
+
+
 async def test_vad_restart_during_grace_cancels_pending_flush(make_session: MakeSession):
     """Inter-option pause: VAD reports stopped, then re-started before the
     grace period elapses. The pending flush must cancel — fragmenting a
@@ -242,12 +283,29 @@ async def test_empty_transcription_is_ignored(make_session: MakeSession):
 async def test_interruption_frame_marks_interrupted_unconditionally(
     make_session: MakeSession,
 ):
-    """Explicit `InterruptionFrame` always interrupts — no bot-speaking gate."""
-    proc, runner, _ = await _make_processor(make_session)
+    """Explicit `InterruptionFrame` always interrupts — no bot-speaking gate.
+
+    Asserts EXACTLY ONE `InterruptionFrame` lands at the sink (the original,
+    re-emitted by the trailing `push_frame` in `process_frame`). The
+    explicit branch must NOT also synthesize a second one — `_handle_barge_in`
+    is called with `downstream_interruption=False` precisely to avoid that
+    double-push. A future flip to `True` here would put two
+    `InterruptionFrame`s downstream and confuse the TTS service.
+    """
+    proc, runner, sink = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
         await runner.out_queue.put("stale")
+        baseline_interrupts = sum(1 for f in sink.received if isinstance(f, InterruptionFrame))
         await proc.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+        new_interrupts = (
+            sum(1 for f in sink.received if isinstance(f, InterruptionFrame)) - baseline_interrupts
+        )
+        assert new_interrupts == 1, (
+            f"expected exactly one InterruptionFrame at sink (the re-emitted "
+            f"original), got {new_interrupts}; sink contents: "
+            f"{[type(f).__name__ for f in sink.received]}"
+        )
         assert runner.out_queue.empty()
     finally:
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
@@ -338,4 +396,40 @@ async def test_pump_pushes_out_queue_text_downstream_as_tts_speak_frame(
             )
         )
     finally:
+        await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+
+
+async def test_pump_gives_up_after_consecutive_failures_and_marks_session(
+    make_session: MakeSession,
+):
+    """If the downstream pipeline is gone (transport torn down), each
+    `push_frame` from `_pump_output` raises. After `_PUMP_FAILURE_GIVE_UP`
+    consecutive failures the pump must stop trying and set
+    `completion_reason='pipeline_torn_down'` so the call session terminates
+    instead of consuming `out_queue` forever and discarding every reply.
+    """
+    proc, runner, _sink = await _make_processor(make_session)
+    # Capture the original BEFORE the try so the finally always sees it.
+    original_push = proc.push_frame
+
+    async def always_fail(frame: Frame, direction: FrameDirection) -> None:
+        if isinstance(frame, TTSSpeakFrame):
+            raise RuntimeError("downstream gone")
+        await original_push(frame, direction)
+
+    try:
+        await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+        # Replace push_frame so every TTSSpeakFrame pump-out raises. After
+        # `_PUMP_FAILURE_GIVE_UP` failures the pump must give up and mark
+        # the session.
+        proc.push_frame = always_fail  # pyright: ignore[reportAttributeAccessIssue]
+        for i in range(StateMachineProcessor._PUMP_FAILURE_GIVE_UP):  # pyright: ignore[reportPrivateUsage]
+            await runner.out_queue.put(f"reply-{i}")
+        await wait_until(
+            lambda: runner.session.completion_reason == "pipeline_torn_down",
+            timeout=2.0,
+        )
+    finally:
+        # Restore so EndFrame-on-the-way-out can flow through.
+        proc.push_frame = original_push  # pyright: ignore[reportAttributeAccessIssue]
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)

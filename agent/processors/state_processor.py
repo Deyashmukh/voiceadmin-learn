@@ -212,7 +212,15 @@ class StateMachineProcessor(FrameProcessor):
         await self._runner.stop()
         log.info("state_processor_stopped")
 
+    _PUMP_FAILURE_GIVE_UP = 3
+    """Consecutive `push_frame` failures before we conclude the downstream
+    pipeline is gone and stop trying to deliver TTS responses. A single
+    failure can be a transient frame-routing race; three in a row means
+    the transport is torn down and continuing is a silent waste of LLM
+    output."""
+
     async def _pump_output(self) -> None:
+        consecutive_failures = 0
         while True:
             response = await self._runner.out_queue.get()
             try:
@@ -223,10 +231,28 @@ class StateMachineProcessor(FrameProcessor):
                 # prevent overlapping audio — that's our concurrency guard for
                 # back-to-back agent utterances.
                 await self.push_frame(TTSSpeakFrame(text=response), FrameDirection.DOWNSTREAM)
+                consecutive_failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # If downstream tears down before _stop() runs, push_frame can
-                # raise. Log and keep consuming so the runner isn't back-pressured
-                # on a full out_queue forever.
-                log.warning("pump_push_failed", error=str(exc))
+                # A discarded TTS response is a user-visible defect (the
+                # agent's reply never reaches the caller), not a warning —
+                # log at error level. After `_PUMP_FAILURE_GIVE_UP` in a row
+                # we conclude the pipeline is gone and surface a completion
+                # reason so the call session terminates instead of hanging
+                # silently on out_queue forever.
+                consecutive_failures += 1
+                log.error(
+                    "pump_push_failed",
+                    error_class=type(exc).__name__,
+                    error=str(exc),
+                    consecutive_failures=consecutive_failures,
+                )
+                if consecutive_failures >= self._PUMP_FAILURE_GIVE_UP:
+                    if self._runner.session.completion_reason is None:
+                        self._runner.session.completion_reason = "pipeline_torn_down"
+                    log.error(
+                        "pump_giving_up",
+                        consecutive_failures=consecutive_failures,
+                    )
+                    return

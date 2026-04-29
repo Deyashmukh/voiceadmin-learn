@@ -14,6 +14,7 @@ from typing import NoReturn
 
 import pytest
 import structlog.contextvars
+import structlog.testing
 
 from agent import tools
 from agent.actuator import Actuator, CallActuator
@@ -155,8 +156,14 @@ async def test_jsonl_write_failure_does_not_abort_call(
     make_session: MakeSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """Best-effort logging contract: a failed write must not propagate into
-    call teardown. Point `BENEFITS_LOG_PATH` at a path inside a non-existent
-    directory; the consumer must still finish cleanly."""
+    call teardown, AND it must surface in the logs. Without the log assertion
+    a refactor that swapped `except OSError:` to `except Exception: pass`
+    would silently drop benefits records and pass this test.
+
+    Uses `structlog.testing.capture_logs` to assert the
+    `benefits_record_write_failed` event fires at error level — the contract
+    is "best-effort, but observable", not "best-effort and silent".
+    """
     monkeypatch.setenv("BENEFITS_LOG_PATH", str(tmp_path / "missing-dir" / "benefits.jsonl"))
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
@@ -164,15 +171,23 @@ async def test_jsonl_write_failure_does_not_abort_call(
             tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
         )
     ]
-    try:
-        await runner.start()
-        runner.submit_transcript("Thank you, goodbye.")
-        # Wait for the consumer to actually finish so the write attempt
-        # (and its log warning) has run, even though it'll fail.
-        await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
-    finally:
-        await runner.stop()
+    with structlog.testing.capture_logs() as captured:
+        try:
+            await runner.start()
+            runner.submit_transcript("Thank you, goodbye.")
+            await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+        finally:
+            await runner.stop()
     assert runner.session.completion_reason == "benefits_extracted"
+    write_failed_events = [
+        e
+        for e in captured
+        if e.get("event") == "benefits_record_write_failed" and e.get("log_level") == "error"
+    ]
+    assert len(write_failed_events) == 1, (
+        f"expected exactly one error-level benefits_record_write_failed event, "
+        f"got {len(write_failed_events)}; all events: {[e.get('event') for e in captured]}"
+    )
 
 
 async def test_ivr_turn_dispatches_send_dtmf_intent(make_session: MakeSession):
