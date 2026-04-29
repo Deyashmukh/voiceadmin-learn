@@ -15,6 +15,7 @@ import structlog.contextvars
 from agent import tools
 from agent.actuator import Actuator, CallActuator
 from agent.call_session import CallSessionRunner, ToolDispatcher
+from agent.errors import ActuatorError
 from agent.schemas import (
     Benefits,
     CallSession,
@@ -467,8 +468,9 @@ async def test_call_actuator_without_twilio_client_rejects_dtmf(make_session: Ma
     session = make_session()
     out_queue: asyncio.Queue[str] = asyncio.Queue()
     actuator = CallActuator(session=session, out_queue=out_queue, twilio_client=None)
-    with pytest.raises(RuntimeError, match="DTMFIntent emitted but actuator has no twilio_client"):
+    with pytest.raises(ActuatorError) as exc_info:
         await actuator.execute(DTMFIntent(digits="1"))
+    assert exc_info.value.intent_kind == "dtmf"
 
 
 async def test_call_actuator_dispatches_dtmf_via_send_digits(make_session: MakeSession):

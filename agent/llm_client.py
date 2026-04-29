@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
 from groq import AsyncGroq
 from pydantic import BaseModel, ValidationError
 
+from agent.errors import ConfigurationError, LLMRefusalError, LLMStopReason
 from agent.logging_config import log
 from agent.observability import enrich_current_generation, observe
 from agent.schemas import IVRTurnResponse, ToolCall, ToolName, Turn
@@ -22,6 +23,11 @@ REP_MODEL = "claude-haiku-4-5"
 # Llama 4 Scout via Groq — fast first-token latency (~80ms p50), tool
 # calling supported, $0.11/$0.34 per 1M in/out at the time of writing.
 IVR_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# Runtime-validated set of recognized LLM stop reasons. Anything outside
+# this falls back to "unknown" so dashboard aggregations don't bucket on
+# typos / new SDK values we haven't classified yet.
+_KNOWN_STOP_REASONS: frozenset[str] = frozenset(get_args(LLMStopReason))
 
 
 class AnthropicRepClient:
@@ -51,7 +57,7 @@ class AnthropicRepClient:
             return
         key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not key:
-            raise RuntimeError("ANTHROPIC_API_KEY is not set")
+            raise ConfigurationError("ANTHROPIC_API_KEY is not set", setting="ANTHROPIC_API_KEY")
         self._client = AsyncAnthropic(api_key=key)
 
     @observe(as_type="generation", name="anthropic.complete_structured")
@@ -81,12 +87,19 @@ class AnthropicRepClient:
         parsed = response.parsed_output
         if parsed is None:
             # Refusal or schema mismatch — surface explicitly so callers can fall back.
-            # Include the response id for Langfuse / dashboard correlation.
-            stop = getattr(response, "stop_reason", "unknown")
+            # The raw value is `Any` from `getattr`; narrow against the Literal
+            # set so an SDK that adds a new stop reason doesn't silently leak
+            # an unrecognized string into Langfuse aggregations.
+            raw_stop = getattr(response, "stop_reason", "unknown")
+            stop: LLMStopReason = (
+                cast(LLMStopReason, raw_stop) if raw_stop in _KNOWN_STOP_REASONS else "unknown"
+            )
             request_id = getattr(response, "id", "unknown")
-            raise RuntimeError(
+            raise LLMRefusalError(
                 f"Anthropic messages.parse() returned no parsed_output "
-                f"(stop_reason={stop}, response_id={request_id})"
+                f"(stop_reason={stop}, response_id={request_id})",
+                stop_reason=stop,
+                response_id=request_id,
             )
         return parsed
 
@@ -130,7 +143,7 @@ class GroqToolCallingClient:
             return
         key = api_key or os.environ.get("GROQ_API_KEY")
         if not key:
-            raise RuntimeError("GROQ_API_KEY is not set")
+            raise ConfigurationError("GROQ_API_KEY is not set", setting="GROQ_API_KEY")
         self._client = AsyncGroq(api_key=key)
         self._model = model
 

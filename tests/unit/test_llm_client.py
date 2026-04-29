@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.errors import ConfigurationError, LLMRefusalError
 from agent.llm_client import (
     IVR_MODEL,
     REP_MODEL,
@@ -62,8 +63,9 @@ def _patched_client(
 
 def test_anthropic_rep_client_requires_api_key(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY is not set"):
+    with pytest.raises(ConfigurationError) as exc_info:
         AnthropicRepClient()
+    assert exc_info.value.setting == "ANTHROPIC_API_KEY"
 
 
 def test_anthropic_rep_client_accepts_explicit_key(monkeypatch: pytest.MonkeyPatch):
@@ -150,11 +152,29 @@ async def test_complete_structured_raises_when_parsed_output_is_none():
     Surface explicitly so callers can fall back rather than crash with
     AttributeError downstream. Error message must include the response id so
     the failure is correlatable in Langfuse / dashboards."""
-    client, _ = _patched_client(parse_returns=None, response_id="msg_refused_xyz")
-    with pytest.raises(RuntimeError, match=r"no parsed_output.*response_id=msg_refused_xyz"):
+    client, parse_mock = _patched_client(parse_returns=None, response_id="msg_refused_xyz")
+    # Set a realistic refusal stop_reason so the assertion locks the
+    # provider-value passthrough rather than the fixture default.
+    parse_mock.return_value.stop_reason = "refusal"
+    with pytest.raises(LLMRefusalError) as exc_info:
         await client.complete_structured(
             system="x", history=[{"role": "user", "content": "y"}], schema=RepTurnOutput
         )
+    assert exc_info.value.response_id == "msg_refused_xyz"
+    assert exc_info.value.stop_reason == "refusal"
+
+
+async def test_complete_structured_falls_back_to_unknown_on_unrecognized_stop_reason():
+    """If the SDK ever returns a stop_reason outside the known Literal set
+    (new Anthropic value, garbled response), the client narrows to
+    `unknown` so dashboards don't bucket on typos."""
+    client, parse_mock = _patched_client(parse_returns=None, response_id="msg_x")
+    parse_mock.return_value.stop_reason = "pause_turn"  # hypothetical future reason
+    with pytest.raises(LLMRefusalError) as exc_info:
+        await client.complete_structured(
+            system="x", history=[{"role": "user", "content": "y"}], schema=RepTurnOutput
+        )
+    assert exc_info.value.stop_reason == "unknown"
 
 
 async def test_complete_structured_extracts_usage_from_response(rep_output: RepTurnOutput):
@@ -310,8 +330,9 @@ def _patched_groq(
 
 def test_groq_client_requires_api_key(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    with pytest.raises(RuntimeError, match="GROQ_API_KEY is not set"):
+    with pytest.raises(ConfigurationError) as exc_info:
         GroqToolCallingClient()
+    assert exc_info.value.setting == "GROQ_API_KEY"
 
 
 def test_groq_client_accepts_explicit_key(monkeypatch: pytest.MonkeyPatch):
