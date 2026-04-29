@@ -71,7 +71,7 @@ These matter only when real users call the agent. We're not deploying.
 - Separate fallback nodes for `CLARIFICATION`, `WAIT`, `RETRY` — one fallback node, split only if M7' forces it.
 - Health checks, readiness probes, IaC, secrets managers, alerting, multi-region, persistence layer — all deployment infrastructure.
 
-Note on retry handling: there are currently ≤2 retry surfaces (LLM 429 backoff, Twilio API blip). Hand-rolled retries with explicit per-call budget are clearer than a framework at this scale. Revisit `tenacity` if a third surface appears or the budget logic gets non-trivial.
+Note on retry handling: no retries are wired today. When we add them, we expect ≤2 surfaces (LLM 429 backoff, Twilio API blip), each hand-rolled with an explicit per-call budget. Revisit `tenacity` if a third surface appears or the budget logic gets non-trivial.
 
 ## Things we DO require for production-grade dev quality
 
