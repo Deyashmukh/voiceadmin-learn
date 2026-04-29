@@ -22,12 +22,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
+from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -52,9 +54,40 @@ app = FastAPI()
 TWILIO_SAMPLE_RATE = int(os.getenv("TWILIO_SAMPLE_RATE", "8000"))
 
 _IVR_SYSTEM_PROMPT = (
-    "You are an IVR navigation agent. Use the provided tools to send DTMF, "
-    "speak briefly when needed, record benefits the IVR reads aloud, and "
-    "transfer to the rep when the IVR signals a handoff."
+    "You are a provider's-office agent calling a payer's IVR to verify "
+    "patient eligibility. The user message you receive is one complete IVR "
+    "utterance — typically a menu listing several numbered options, or a "
+    "prompt asking for information. Treat it as input, NOT something to "
+    "echo back. Every action is exactly one tool call; never reply in "
+    "natural language.\n"
+    "\n"
+    "Goal: navigate the IVR to verify member benefits, providing requested "
+    "patient details, and accept a transfer to a representative.\n"
+    "\n"
+    "How to act on each turn:\n"
+    "- One IVR utterance = one menu (or one prompt) = one tool call from you.\n"
+    "- If the utterance lists numbered options ('press 1 for X, press 2 for "
+    "Y, press 3 for Z'), pick the SINGLE digit that best advances the goal "
+    "and call `send_dtmf` with just that one digit. The IVR will play the "
+    "next menu after you press; that next menu will arrive as a new turn.\n"
+    "- If the utterance asks for information (member ID, DOB, patient name), "
+    "call `speak` with ONLY that data — no preamble, no acknowledgement.\n"
+    "- If the utterance is reading benefit details, call `record_benefit` to "
+    "capture them.\n"
+    "- If the utterance signals a handoff ('one moment', 'connecting you', "
+    "'please hold'), call `transfer_to_rep`.\n"
+    "- If the call is over ('thank you, goodbye'), call `complete_call`.\n"
+    "- Only call `fail_with_reason` when the IVR is truly stuck (silent or "
+    "looping with no usable options).\n"
+    "\n"
+    "Tools:\n"
+    "- `send_dtmf(digits)`\n"
+    "- `speak(text)`\n"
+    "- `record_benefit(...)`\n"
+    "- `transfer_to_rep()`\n"
+    "- `complete_call(reason)`\n"
+    "- `fail_with_reason(reason)`\n"
+    "Output exactly one tool call per turn."
 )
 _REP_PROMPT_TEMPLATE = (Path(__file__).parent / "prompts" / "rep_turn.v1.txt").read_text()
 
@@ -130,9 +163,11 @@ async def ws(websocket: WebSocket) -> None:
     )
 
     stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
-    tts = CartesiaTTSService(
-        api_key=os.environ["CARTESIA_API_KEY"],
-        voice_id=os.environ.get("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
+    tts = ElevenLabsTTSService(
+        api_key=os.environ["ELEVENLABS_API_KEY"],
+        # Default voice = "Sarah" (mature, reassuring premade voice — fits a
+        # provider's-office persona). Override via env for a different voice.
+        voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL"),
     )
 
     patient = _default_patient()
@@ -151,9 +186,17 @@ async def ws(websocket: WebSocket) -> None:
     )
     state_proc = StateMachineProcessor(runner)
 
+    # VAD sits between transport.input() and STT. It emits
+    # `VADUserStartedSpeakingFrame` when speech begins, which the state
+    # processor uses as the barge-in signal (mark_interrupted → cancel
+    # in-flight turn + drain queues). Without it, rep-mode interruption
+    # never fires.
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer())
+
     pipeline = Pipeline(
         [
             transport.input(),
+            vad,
             stt,
             state_proc,
             tts,

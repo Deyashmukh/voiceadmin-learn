@@ -402,7 +402,7 @@ async def test_groq_client_passes_call_args_to_sdk():
     await client.complete_with_tools(system="sys", history=[], tools=[{"x": 1}], temperature=0.2)
     kwargs = create_mock.call_args.kwargs
     assert kwargs["model"] == IVR_MODEL
-    assert kwargs["tool_choice"] == "auto"
+    assert kwargs["tool_choice"] == "required"
     assert kwargs["temperature"] == 0.2
     assert kwargs["tools"] == [{"x": 1}]
     assert kwargs["max_tokens"] == 512

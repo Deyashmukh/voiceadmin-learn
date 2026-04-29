@@ -9,13 +9,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import NoReturn
 
-import pytest
 import structlog.contextvars
 
 from agent import tools
 from agent.actuator import Actuator, CallActuator
 from agent.call_session import CallSessionRunner, ToolDispatcher
-from agent.errors import ActuatorError
 from agent.schemas import (
     Benefits,
     CallSession,
@@ -459,35 +457,19 @@ async def test_each_queued_transcript_drives_its_own_turn(make_session: MakeSess
         await runner.stop()
 
 
-# --- DTMFIntent without a twilio client raises (CallActuator path) --------
+# --- DTMFIntent currently routes through speech (TEMP — see actuator.py) ---
 
 
-async def test_call_actuator_without_twilio_client_rejects_dtmf(make_session: MakeSession):
-    """The default CallActuator raises if asked to dispatch DTMF without a
-    Twilio client. Locks the precondition for live-call wiring."""
+async def test_call_actuator_dtmf_speaks_digits_via_out_queue(make_session: MakeSession):
+    """TEMP: until DTMF is rendered as audio tones over the Media Stream, the
+    actuator stands in by enqueueing a spoken-digit string. This test pins that
+    contract; when real DTMF lands it should be replaced with one asserting an
+    audio frame goes out."""
     session = make_session()
     out_queue: asyncio.Queue[str] = asyncio.Queue()
     actuator = CallActuator(session=session, out_queue=out_queue, twilio_client=None)
-    with pytest.raises(ActuatorError) as exc_info:
-        await actuator.execute(DTMFIntent(digits="1"))
-    assert exc_info.value.intent_kind == "dtmf"
-
-
-async def test_call_actuator_dispatches_dtmf_via_send_digits(make_session: MakeSession):
-    """Live-call DTMF path: actuator forwards `(twilio_client, call_sid, digits)`
-    to `send_digits`. Locks the call-arity boundary — a regression that swaps
-    args silently breaks IVR navigation in production calls."""
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    session = make_session()
-    out_queue: asyncio.Queue[str] = asyncio.Queue()
-    twilio_client = MagicMock()
-    actuator = CallActuator(session=session, out_queue=out_queue, twilio_client=twilio_client)
-
-    with patch("agent.actuator.send_digits", new_callable=AsyncMock) as send_mock:
-        await actuator.execute(DTMFIntent(digits="123"))
-
-    send_mock.assert_awaited_once_with(twilio_client, session.call_sid, "123")
+    await actuator.execute(DTMFIntent(digits="123"))
+    assert await out_queue.get() == "Pressing 123."
 
 
 async def test_call_actuator_hangup_is_noop(make_session: MakeSession):

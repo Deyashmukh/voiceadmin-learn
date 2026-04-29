@@ -8,6 +8,7 @@ dependencies = [
     "anthropic==0.97.0",
     "cartesia==3.0.2",
     "deepgram-sdk==6.1.1",
+    "elevenlabs>=2.45.0",
     "fastapi==0.136.0",
     "groq==1.1.2",
     "langfuse==4.5.0",

@@ -156,14 +156,29 @@ class GroqToolCallingClient:
         temperature: float = 0.1,
     ) -> IVRTurnResponse:
         messages = _history_to_groq_messages(system, history)
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=cast(Any, messages),
-            tools=cast(Any, tools),
-            tool_choice="auto",
-            temperature=temperature,
-            max_tokens=512,
-        )
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=cast(Any, messages),
+                tools=cast(Any, tools),
+                # IVR turns are deterministic action selection — every output
+                # must be a tool call. `required` forces the model to pick
+                # one. Llama-4-Scout sometimes errors `tool_use_failed` (400)
+                # when input is conversational and it can't classify; the
+                # `except` below converts that into a no-progress turn rather
+                # than killing the consumer.
+                tool_choice="required",
+                temperature=temperature,
+                max_tokens=512,
+            )
+        except Exception as exc:
+            # Any 4xx / 5xx / network glitch from Groq must NOT propagate up
+            # and kill the call-session consumer. Returning an empty
+            # IVRTurnResponse counts as a no-progress turn — two in a row
+            # trips the watchdog, which is the right termination story for a
+            # provider that's persistently failing.
+            log.warning("ivr_llm_call_failed", error=str(exc)[:300])
+            return IVRTurnResponse(tool_calls=[], text="")
         choice = response.choices[0]
         msg = choice.message
         parsed_calls: list[ToolCall] = []

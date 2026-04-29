@@ -6,14 +6,18 @@ from collections.abc import Callable
 
 import pytest
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
     Frame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     StartFrame,
-    TextFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
     UserStartedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -50,6 +54,7 @@ class _SinkProcessor(FrameProcessor):
 async def _make_processor(
     make_session: Callable[..., CallSession],
     ivr_responses: list[IVRTurnResponse] | None = None,
+    transcript_debounce_s: float = 0.0,
 ) -> tuple[StateMachineProcessor, CallSessionRunner, _SinkProcessor]:
     session = make_session()
     ivr_llm = FakeIVRLLMClient(responses=list(ivr_responses or []))
@@ -63,17 +68,28 @@ async def _make_processor(
         tools=[],
         actuator=FakeActuator(),
     )
-    proc = StateMachineProcessor(runner, enable_direct_mode=True)
+    # Default 0s debounce so transcripts flush immediately and assertions
+    # don't have to budget for the production 2.5s wait. The dedicated
+    # debounce test overrides to a small positive value.
+    proc = StateMachineProcessor(
+        runner,
+        enable_direct_mode=True,
+        transcript_debounce_s=transcript_debounce_s,
+    )
     sink = _SinkProcessor()
     proc.link(sink)
     return proc, runner, sink
 
 
-def _finalized(text: str) -> TranscriptionFrame:
-    """TranscriptionFrame in the shape Pipecat emits at end-of-utterance."""
-    frame = TranscriptionFrame(text=text, user_id="user", timestamp="t")
-    frame.finalized = True
-    return frame
+def _transcription(text: str) -> TranscriptionFrame:
+    """TranscriptionFrame in the shape Pipecat emits at end-of-utterance.
+
+    Pipecat's STT services (Deepgram, etc.) push `TranscriptionFrame` only for
+    is_final results — interim results use `InterimTranscriptionFrame`. The
+    `finalized` field is unrelated metadata for forced-finalize cases and is
+    not set by streaming STT, so we don't set it here either.
+    """
+    return TranscriptionFrame(text=text, user_id="user", timestamp="t")
 
 
 # --- Lifecycle ----------------------------------------------------------------
@@ -107,14 +123,14 @@ async def test_cancel_frame_stops_runner(make_session: MakeSession):
 # --- Frame routing ------------------------------------------------------------
 
 
-async def test_finalized_transcription_enqueues_to_runner(make_session: MakeSession):
+async def test_transcription_enqueues_to_runner(make_session: MakeSession):
     ivr_llm_responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})])
     ]
     proc, runner, _ = await _make_processor(make_session, ivr_responses=ivr_llm_responses)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
-        await proc.process_frame(_finalized("hello"), FrameDirection.DOWNSTREAM)
+        await proc.process_frame(_transcription("hello"), FrameDirection.DOWNSTREAM)
         # The consumer pulls the transcript and runs a turn; queued response
         # ends the call. If routing or enqueue is broken the call never
         # terminates and the wait times out.
@@ -123,36 +139,84 @@ async def test_finalized_transcription_enqueues_to_runner(make_session: MakeSess
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
 
-async def test_non_finalized_transcription_is_ignored(make_session: MakeSession):
+async def test_interim_transcription_is_not_enqueued(make_session: MakeSession):
     proc, runner, _ = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
-        interim = TranscriptionFrame(text="hel", user_id="user", timestamp="t")
-        interim.finalized = False
+        interim = InterimTranscriptionFrame(text="hel", user_id="user", timestamp="t")
         await proc.process_frame(interim, FrameDirection.DOWNSTREAM)
         assert runner.in_queue.empty()
     finally:
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
 
-async def test_empty_finalized_transcription_is_ignored(make_session: MakeSession):
+async def test_transcripts_are_debounced_into_one_submission(make_session: MakeSession):
+    """Three TranscriptionFrames within the debounce window should collapse to
+    one submission carrying the joined text. IVR menus arrive as multiple
+    finals; the debouncer prevents the agent from reacting to fragments.
+
+    No StartFrame here — we want to inspect what `submit_transcript` receives
+    without the consumer immediately draining `in_queue`.
+    """
+    proc, runner, _ = await _make_processor(make_session, transcript_debounce_s=0.05)
+    await proc.process_frame(_transcription("Press 1 for benefits."), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(_transcription("Press 2 for claims."), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(_transcription("Press 9 for a rep."), FrameDirection.DOWNSTREAM)
+    await wait_until(lambda: not runner.in_queue.empty(), timeout=5.0)
+    combined = runner.in_queue.get_nowait()
+    assert combined == "Press 1 for benefits. Press 2 for claims. Press 9 for a rep."
+    assert runner.in_queue.empty()
+
+
+async def test_empty_transcription_is_ignored(make_session: MakeSession):
     proc, runner, _ = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
-        await proc.process_frame(_finalized("   "), FrameDirection.DOWNSTREAM)
+        await proc.process_frame(_transcription("   "), FrameDirection.DOWNSTREAM)
         assert runner.in_queue.empty()
     finally:
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
 
-@pytest.mark.parametrize("interrupt_frame", [UserStartedSpeakingFrame(), InterruptionFrame()])
-async def test_interrupt_frames_mark_interrupted(make_session: MakeSession, interrupt_frame: Frame):
+async def test_interruption_frame_marks_interrupted_unconditionally(
+    make_session: MakeSession,
+):
+    """Explicit `InterruptionFrame` always interrupts — no bot-speaking gate."""
     proc, runner, _ = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
         await runner.out_queue.put("stale")
-        await proc.process_frame(interrupt_frame, FrameDirection.DOWNSTREAM)
+        await proc.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
         assert runner.out_queue.empty()
+    finally:
+        await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+
+
+@pytest.mark.parametrize("vad_frame", [UserStartedSpeakingFrame(), VADUserStartedSpeakingFrame()])
+async def test_vad_speech_start_only_interrupts_while_bot_speaking(
+    make_session: MakeSession, vad_frame: Frame
+):
+    """VAD-driven speech-start frames only mark an interrupt while the agent
+    is actually playing TTS audio (bracketed by Bot{Started,Stopped}SpeakingFrame).
+    Otherwise — e.g. during a multi-sentence IVR menu where the caller
+    naturally pauses between options — the buffer must NOT be drained.
+    """
+    proc, runner, _ = await _make_processor(make_session)
+    try:
+        await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+        # Bot NOT speaking yet → VAD speech-start is a no-op.
+        await runner.out_queue.put("stale-1")
+        await proc.process_frame(vad_frame, FrameDirection.DOWNSTREAM)
+        assert not runner.out_queue.empty()
+        # Bot starts speaking → VAD speech-start now interrupts.
+        await proc.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await proc.process_frame(vad_frame, FrameDirection.DOWNSTREAM)
+        assert runner.out_queue.empty()
+        # Bot stops speaking → VAD speech-start is a no-op again.
+        await proc.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await runner.out_queue.put("stale-2")
+        await proc.process_frame(vad_frame, FrameDirection.DOWNSTREAM)
+        assert not runner.out_queue.empty()
     finally:
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
@@ -160,13 +224,17 @@ async def test_interrupt_frames_mark_interrupted(make_session: MakeSession, inte
 # --- Output pump -------------------------------------------------------------
 
 
-async def test_pump_pushes_out_queue_text_downstream_as_textframe(make_session: MakeSession):
+async def test_pump_pushes_out_queue_text_downstream_as_tts_speak_frame(
+    make_session: MakeSession,
+):
     proc, runner, sink = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
         await runner.out_queue.put("hello there")
         await wait_until(
-            lambda: any(isinstance(f, TextFrame) and f.text == "hello there" for f in sink.received)
+            lambda: any(
+                isinstance(f, TTSSpeakFrame) and f.text == "hello there" for f in sink.received
+            )
         )
     finally:
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)

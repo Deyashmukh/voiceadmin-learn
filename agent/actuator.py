@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Protocol, assert_never
 
-from agent.errors import ActuatorError
 from agent.schemas import (
     CallSession,
     DTMFIntent,
@@ -28,7 +27,6 @@ from agent.schemas import (
     SideEffectIntent,
     SpeakIntent,
 )
-from agent.telephony.dtmf import send_digits
 
 
 class Actuator(Protocol):
@@ -62,13 +60,14 @@ class CallActuator:
                 # rather than dropping spoken text on the floor.
                 await self.out_queue.put(intent.text)
             case DTMFIntent():
-                if self.twilio_client is None:
-                    raise ActuatorError(
-                        "DTMFIntent emitted but actuator has no twilio_client; "
-                        "wire one in via CallSessionRunner construction.",
-                        intent_kind="dtmf",
-                    )
-                await send_digits(self.twilio_client, self.session.call_sid, intent.digits)
+                # TEMP: Twilio's REST `<Play digits>` update replaces the active
+                # TwiML and ends the call. Until we generate DTMF tones as audio
+                # and push them through the WSS as OutputAudioRawFrame (the real
+                # fix), we stand in by speaking the digits aloud. For the
+                # voice-roleplay test this is enough — the human IVR-roleplayer
+                # hears "press one" and advances. Production-correct DTMF must
+                # land before this code goes anywhere near a real payer.
+                await self.out_queue.put(f"Pressing {intent.digits}.")
             case HangupIntent():
                 # Termination is driven by `session.completion_reason`, which
                 # the dispatcher set when the LLM emitted complete_call /
