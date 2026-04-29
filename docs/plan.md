@@ -2,7 +2,7 @@
 
 ## Context
 
-After a deep-dive on Revenue Cycle Management (RCM) and how production voice agents like VoiceAdmin work, the goal is to build a **working voice agent end-to-end** — not for production, but to internalize how these systems are actually architected. Specifically: how an LLM-with-tools layer drives deterministic side effects (DTMF, TTS, structured extraction), how **VAD + barge-in** creates the illusion of natural conversation, and how this stack touches real telephony.
+After a deep-dive on Revenue Cycle Management (RCM) and how production voice agents like VoiceAdmin work, the goal is to build a **working voice agent end-to-end** — not deployed to real users, but built at production-grade dev quality so that the code, tests, and process would pass a senior production-readiness review. The project teaches both how these systems are architected (LLM-with-tools, deterministic side effects, VAD + barge-in, real telephony) AND the discipline (typing, tests, CI, error handling, observability) of shipping code that wouldn't embarrass a staff engineer. Deployment-grade infrastructure (IaC, secrets, alerting, multi-region, persistence) stays out of scope; dev-quality bar does not.
 
 The target workflow is **Eligibility & Benefits Verification** — the canonical RCM voice task. The agent calls a "payer," authenticates with provider info, navigates an IVR menu, transitions to a human rep when handed off, holds a natural conversation to extract benefits, and ends the call cleanly with structured JSON: `{active, deductible_remaining, copay, coinsurance, out_of_network_coverage}`.
 
@@ -283,6 +283,17 @@ If a hold *announcement* gets transcribed (e.g., *"please continue to hold"*), i
 
 16. **M7'+ — Rep deviations (optional, only if M7' clean).** User adds three rep deviations across runs: small talk (weather), ambiguous answer (rep hedges), emotional content (rep mentions difficult day). Verify rep LLM handles each via persona prompting alone — no template logic, no banned-phrase lint.
 
+17. **M8' — Production-grade dev quality.** Lift the codebase from "learning project" rigor to "would pass a senior production-readiness review." Each sub-task is its own PR. Runs in parallel with the M6'/M7' live-testing track (no shared state) but should land before the project is treated as a finished reference.
+
+    - **M8'/A — Pyright strict.** Switch `[tool.pyright]` to strict per-file with `# pyright: strict` headers. Add `# type: ignore[X]` only for the few real Pipecat snags. Expectation: strict surfaces a handful of latent bugs (untyped optional access, missing return types, partial unknown types from the SDK) — fix each one rather than blanket-ignoring.
+    - **M8'/B — GitHub Actions CI.** Single workflow that runs `uv sync`, `ruff check`, `ruff format --check`, `pyright`, `pytest tests/unit` on every PR. Required check on `main`. Pre-commit stays as a developer convenience; CI is the gate.
+    - **M8'/C — Coverage thresholds.** Add `pytest-cov` dev dep. Per-module thresholds enforced in CI: 95% on `agent/call_session.py`, 90% on `agent/tools.py`, 85% on `agent/observability.py`, 80% on `agent/main.py`. Coverage gaps surfaced before merge.
+    - **M8'/D — Hypothesis dispatcher tests.** Add `hypothesis` dev dep. Property-based tests on `agent/tools.py:dispatch` covering: DTMF digit allowlist × menu options × universal keys; `record_benefit` field-type matrix (bool/float ↔ each `BenefitField`); arg-validator rejection paths. The combinatorial space is exactly Hypothesis's strength.
+    - **M8'/E — Error taxonomy.** Define `agent.errors.AgentError` base + specific subclasses (`LLMRefusalError`, `DestinationNotAllowedError`, `ToolDispatchError`, `ActuatorError`). Replace ad-hoc `RuntimeError("...")` raises across `llm_client.py` / `actuator.py` / `dialer.py`. Callers catch by type, not by string-match.
+    - **M8'/F — Barge-in latency regression test.** Lock `cancel-to-silence < 150ms` (M2's quantitative gate) as a CI-running test. Verify it still holds through M5'/F's `@observe` decorators (the M5'/F code-reviewer flagged this as a soft concern). Sanity-check on every PR.
+    - **M8'/G — `pip-audit` in CI.** Catches CVE'd transitive deps. Fail CI on high-severity advisories; warn on others.
+    - **M8'/H — Determinism in async tests.** Replace `time.monotonic()` polling helpers (`_wait_until` in `test_call_session.py` and `test_state_processor.py`) with deterministic event-loop control or fake clocks. The M3-era timing flakes (preserved in git history of the deleted `NOTES.md`) were exactly this class of bug.
+
 ## Key files (post-pivot)
 
 ```
@@ -330,10 +341,18 @@ voiceadmin-learn/
 - **M5'/D:** `pytest tests/unit/test_call_session.py` passes; cancellation test (slow-LLM barge-in) cancels within 150ms; `out_queue` is drained on `mark_interrupted` (regression for the M4 post-review fix); watchdogs trigger on no-progress and stuck cases.
 - **M5'/E:** `pyproject.toml` no longer mentions `langgraph` or `langchain`. `agent/graph*.py` and `agent/classifier.py` deleted. `agent/main.py` constructs `CallSession`, not `GraphRunner`. Full unit suite green. (`mock_payer/` was retained at first then deleted in a follow-up cleanup PR — it survives in git history as a learning artifact.)
 - **M5'/F:** Langfuse UI shows trace tree with one session per call; spans nest correctly (per-turn → LLM-call → tool-dispatch), not just spans existing in isolation.
-- **M6':** DTMF tones audible on user's cell during a live Media Streams call. Logged in `NOTES.md`.
+- **M6':** DTMF tones audible on user's cell during a live Media Streams call. Logged in commit message of the M6' branch.
 - **M7':** 5/5 happy-path runs land complete `Benefits`. Per-call total token budget under ~30k (sum across IVR + rep LLMs). Each run has a Langfuse trace.
 - **M7'+:** Each deviation passes 5/5 runs. Logs show the rep LLM's reasoning fields explaining the chosen behavior.
-- **Overall success metric:** 5 consecutive successful end-to-end runs with no manual intervention beyond playing the IVR + rep roles.
+- **M8'/A:** `[tool.pyright]` set to strict; every file in `agent/` carries `# pyright: strict`; CI-level pyright run is clean. Latent bugs surfaced during the strict-flip are fixed individually, not blanket-ignored.
+- **M8'/B:** `.github/workflows/ci.yml` runs `ruff check`, `ruff format --check`, `pyright`, `pytest tests/unit` on every PR; required check on `main`.
+- **M8'/C:** `pytest --cov` enforced in CI with per-module thresholds. Failing coverage blocks merge.
+- **M8'/D:** Hypothesis property tests on `agent/tools.py:dispatch` cover: DTMF allowlist matrix, `record_benefit` field-type matrix, validator rejection paths. Tests run in CI.
+- **M8'/E:** No `RuntimeError("...")` raises remain in `agent/`; every error is a typed `AgentError` subclass.
+- **M8'/F:** `tests/unit/test_barge_in_latency.py` measures `cancel-to-silence < 150ms` and runs in CI.
+- **M8'/G:** `pip-audit` in CI; high-severity advisories fail the build.
+- **M8'/H:** Async timing tests use a deterministic clock; no test relies on `time.monotonic()` polling.
+- **Overall success metric:** 5 consecutive successful end-to-end runs with no manual intervention beyond playing the IVR + rep roles, AND every M8' sub-task green in CI.
 
 ## Decisions made during planning (with pivot history)
 

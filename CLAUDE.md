@@ -1,6 +1,8 @@
 # VoiceAdmin Learn — Project Instructions
 
-This is a learning project: a hybrid voice agent (two-mode `CallSession` + Pipecat audio pipeline + Twilio telephony) that automates healthcare eligibility verification calls. IVR navigation runs an LLM-with-tools loop; rep conversation runs a structured-output LLM (`RepTurnOutput`). The goal is to internalize how production voice agents are architected, not to ship to production.
+This is a learning project: a hybrid voice agent (two-mode `CallSession` + Pipecat audio pipeline + Twilio telephony) that automates healthcare eligibility verification calls. IVR navigation runs an LLM-with-tools loop; rep conversation runs a structured-output LLM (`RepTurnOutput`). The goal is to internalize how production voice agents are architected — including the development discipline (typing, tests, CI, error handling, observability) that production-grade work demands.
+
+We're not deploying to real users. **But the code, tests, and process should pass a senior production-readiness review.** Dev-quality bar is production-grade; deployment-grade infrastructure (IaC, secrets management, alerting, multi-region, persistence) stays out of scope.
 
 Full plan: `docs/plan.md`. Pre-pivot architecture (LangGraph state machine + regex IVR classifier) lives in PR #4 as a learning artifact.
 
@@ -59,15 +61,29 @@ One commit per completed milestone or logical sub-task.
 - **Secrets:** `.env` is gitignored. `.env.example` is checked in with placeholders and comments marking public vs secret keys.
 - **Outbound dial allowlist:** every `calls.create()` passes through a check against the `ALLOWED_DESTINATIONS` env var. Non-negotiable.
 
-## Things to cut as YAGNI
+## Things to cut as YAGNI (deployment-only concerns)
 
-- GitHub Actions CI (local pre-commit is enough).
-- Pyright strict mode (will tar-pit on Pipecat internals).
+These matter only when real users call the agent. We're not deploying.
+
 - Docker for the agent itself (Langfuse uses Docker Compose, but the agent runs with `uv run`).
-- OpenTelemetry / Prometheus / custom metrics.
-- `tenacity` or any retry framework (hand-write the one retry needed).
+- OpenTelemetry / Prometheus / custom production metrics (Langfuse covers LLM traces).
+- `tenacity` or any retry framework (hand-write the one or two retries that improve correctness).
 - Multiple env profiles beyond a single `.env`.
-- Separate fallback nodes for `CLARIFICATION`, `WAIT`, `RETRY` — one fallback node, split only if M7 forces it.
+- Separate fallback nodes for `CLARIFICATION`, `WAIT`, `RETRY` — one fallback node, split only if M7' forces it.
+- Health checks, readiness probes, IaC, secrets managers, alerting, multi-region, persistence layer — all deployment infrastructure.
+
+## Things we DO require for production-grade dev quality
+
+These matter even without real users — the difference between a learning project that hides bugs and one that catches them. Tracked as M8' milestones in `docs/plan.md`.
+
+- **Pyright strict mode**, per-file with explicit `# pyright: strict` and explicit `# type: ignore[X]` for the few real Pipecat snags. Basic mode hides bugs at boundaries.
+- **GitHub Actions CI** running `ruff + pyright + pytest` on every PR. Pre-commit is bypassable; CI is the gate.
+- **Test coverage thresholds** via `pytest-cov` (95% on `agent/call_session.py`, 90% on `agent/tools.py`, lower on entrypoints).
+- **Hypothesis property-based tests** for the tool dispatcher's combinatorial validation matrix.
+- **Error taxonomy** (`AgentError` base + specific subclasses). No string-matching on `RuntimeError` messages; callers catch by type.
+- **Barge-in latency regression test** — `cancel-to-silence < 150ms` (M2's quantitative gate) must keep holding through future changes.
+- **`pip-audit` in CI** — catches CVE'd transitive deps.
+- **Determinism in async tests** — fake clocks for timing-sensitive tests; no flaky polling.
 
 ## Architectural non-negotiables
 
