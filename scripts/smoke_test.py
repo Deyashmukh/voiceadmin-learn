@@ -57,8 +57,6 @@ def smoke_elevenlabs() -> str:
 
 
 def smoke_anthropic() -> str:
-    # Sync client over `messages.create` is enough — we're verifying credentials
-    # + billing, not the async / `messages.parse` path the rep client uses.
     from anthropic import Anthropic
 
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
