@@ -73,5 +73,5 @@ class CallActuator:
                 # fail_with_reason. Nothing to do here on the agent side; the
                 # runner exits its consume loop on the next iteration.
                 pass
-            case _ as unreachable:
+            case _ as unreachable:  # pragma: no cover (proven unreachable by pyright)
                 assert_never(unreachable)
