@@ -80,6 +80,11 @@ ToolName = Literal[
     "send_dtmf", "speak", "record_benefit", "transfer_to_rep", "complete_call", "fail_with_reason"
 ]
 
+# Discriminator union for `SideEffectIntent.kind`. Named so consumers like
+# `agent.errors.ActuatorError.intent_kind` can reference it without
+# redeclaring — keeps the literal set canonical and drift-proof.
+IntentKind = Literal["dtmf", "speak", "hangup"]
+
 
 class ToolCall(BaseModel):
     """A tool invocation produced by the IVR LLM."""
