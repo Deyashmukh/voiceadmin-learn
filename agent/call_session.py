@@ -19,12 +19,11 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 import structlog
-from langfuse import observe
 from pydantic import BaseModel
 
 from agent.actuator import Actuator, CallActuator
 from agent.logging_config import log
-from agent.observability import trace_session
+from agent.observability import observe, trace_session
 from agent.schemas import (
     CallSession,
     IVRTurnResponse,

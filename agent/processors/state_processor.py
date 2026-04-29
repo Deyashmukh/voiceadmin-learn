@@ -37,7 +37,7 @@ class StateMachineProcessor(FrameProcessor):
     """
 
     def __init__(self, runner: CallSessionRunner, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+        super().__init__(**kwargs)  # pyright: ignore[reportUnknownMemberType] (Pipecat stub gap)
         self._runner = runner
         self._pump_task: asyncio.Task[None] | None = None
 

@@ -15,10 +15,9 @@ from typing import Any, cast
 
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
-from langfuse import observe
 from pydantic import BaseModel
 
-from agent.observability import enrich_current_generation
+from agent.observability import enrich_current_generation, observe
 
 REP_MODEL = "claude-haiku-4-5"
 

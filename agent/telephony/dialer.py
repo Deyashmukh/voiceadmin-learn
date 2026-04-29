@@ -8,6 +8,18 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Any, Protocol
+
+
+class _TwilioCalls(Protocol):
+    """Structural shape of the `.calls` resource on a Twilio REST client.
+    Tighter than `Any` for the surface we touch; tests' mocks match structurally."""
+
+    def create(self, *, to: str, from_: str, url: str | None) -> Any: ...
+
+
+class TwilioClientLike(Protocol):
+    calls: _TwilioCalls
 
 
 class DestinationNotAllowedError(Exception):
@@ -35,7 +47,7 @@ def dial(
     to: str,
     from_: str,
     *,
-    twilio_client=None,
+    twilio_client: TwilioClientLike | None = None,
     url: str | None = None,
     allowlist: frozenset[str] | None = None,
 ) -> DialResult:
@@ -54,5 +66,5 @@ def dial(
     if twilio_client is None:
         raise RuntimeError("twilio_client must be provided to dial()")
 
-    call = twilio_client.calls.create(to=to, from_=from_, url=url)
-    return DialResult(call_sid=call.sid, to=to)
+    call: Any = twilio_client.calls.create(to=to, from_=from_, url=url)
+    return DialResult(call_sid=str(call.sid), to=to)

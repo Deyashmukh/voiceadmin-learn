@@ -18,7 +18,7 @@ The tools layer is a pure function — it returns `ToolResult` plus an optional
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Protocol
+from typing import Any, Protocol, assert_never
 
 from agent.schemas import (
     CallSession,
@@ -52,24 +52,26 @@ class CallActuator:
         self.twilio_client = twilio_client
 
     async def execute(self, intent: SideEffectIntent) -> None:
-        if isinstance(intent, SpeakIntent):
-            # `out_queue` is bounded with backpressure — TTS shouldn't fall
-            # behind, and if it does we want the LLM to feel that pressure
-            # rather than dropping spoken text on the floor.
-            await self.out_queue.put(intent.text)
-            return
-        if isinstance(intent, DTMFIntent):
-            if self.twilio_client is None:
-                raise RuntimeError(
-                    "DTMFIntent emitted but actuator has no twilio_client; "
-                    "wire one in via CallSessionRunner construction."
-                )
-            await send_digits(self.twilio_client, self.session.call_sid, intent.digits)
-            return
-        if isinstance(intent, HangupIntent):
-            # Termination is driven by `session.completion_reason`, which the
-            # dispatcher already set when the LLM emitted complete_call /
-            # fail_with_reason. Nothing to do here on the agent side; the
-            # runner will exit its consume loop on the next iteration.
-            return
-        raise RuntimeError(f"actuator received unknown intent: {intent!r}")
+        # `assert_never` in the wildcard branch makes pyright fail at type-check
+        # time if `SideEffectIntent` gains a new variant without a handler here.
+        match intent:
+            case SpeakIntent():
+                # `out_queue` is bounded with backpressure — TTS shouldn't fall
+                # behind, and if it does we want the LLM to feel that pressure
+                # rather than dropping spoken text on the floor.
+                await self.out_queue.put(intent.text)
+            case DTMFIntent():
+                if self.twilio_client is None:
+                    raise RuntimeError(
+                        "DTMFIntent emitted but actuator has no twilio_client; "
+                        "wire one in via CallSessionRunner construction."
+                    )
+                await send_digits(self.twilio_client, self.session.call_sid, intent.digits)
+            case HangupIntent():
+                # Termination is driven by `session.completion_reason`, which
+                # the dispatcher set when the LLM emitted complete_call /
+                # fail_with_reason. Nothing to do here on the agent side; the
+                # runner exits its consume loop on the next iteration.
+                pass
+            case _ as unreachable:
+                assert_never(unreachable)

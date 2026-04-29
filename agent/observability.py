@@ -23,10 +23,48 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Any
+from typing import Any, Literal, TypeVar
+
+from langfuse import observe as _langfuse_observe  # pyright: ignore[reportUnknownVariableType]
 
 from agent.logging_config import log
+
+ObservationType = Literal[
+    "generation",
+    "embedding",
+    "span",
+    "agent",
+    "tool",
+    "chain",
+    "retriever",
+    "evaluator",
+    "guardrail",
+]
+F = TypeVar("F", bound=Callable[..., Any])
+
+__all__ = [
+    "FLUSH_TIMEOUT_S",
+    "enrich_current_generation",
+    "flush_langfuse",
+    "observe",
+    "set_current_span_name",
+    "trace_session",
+]
+
+
+def observe(*, name: str | None = None, as_type: ObservationType | None = None) -> Callable[[F], F]:
+    """Typed wrapper around `langfuse.observe` — single-suppression site.
+
+    The Langfuse SDK has no type stubs. This wrapper owns the one suppression
+    so consumers don't each duplicate `# pyright: ignore`. The return type is
+    `Callable[[F], F]` (decorator-shape preserved). Trade-off: the wrapper
+    intentionally does NOT propagate `as_type` into the wrapped function's
+    type — consumers don't rely on that, and reflecting the SDK's overload
+    set here would re-import the stub gap we're trying to localize."""
+    return _langfuse_observe(name=name, as_type=as_type)  # pyright: ignore[reportUnknownVariableType]
+
 
 FLUSH_TIMEOUT_S = 2.0
 # Captured once at import: dotenv has already loaded by the time agent.main
