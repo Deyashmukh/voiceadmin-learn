@@ -123,18 +123,25 @@ class StateMachineProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
     async def _handle_barge_in(self, *, downstream_interruption: bool) -> None:
-        """Cancel the in-flight runner turn and (optionally) push an
+        """Cancel the in-flight runner turn and (optionally) synthesize an
         InterruptionFrame downstream so Pipecat's TTS service stops
         mid-synthesis and the output transport clears any buffered audio.
 
         Without the downstream propagation, mark_interrupted only stops
-        the runner from generating *new* turns — bytes already queued
-        in the WSS output buffer keep playing and the user keeps hearing
+        the runner from generating *new* turns — bytes already queued in
+        the WSS output buffer keep playing and the user keeps hearing
         the agent for a beat after they barged in.
 
-        `downstream_interruption=False` for the explicit-InterruptionFrame
-        branch because we'll already re-emit the original frame downstream
-        on the way out of `process_frame`.
+        Note on the `downstream_interruption` flag: BOTH branches fall
+        through to the trailing `await self.push_frame(frame, direction)`
+        in `process_frame`, so the original incoming frame ALWAYS reaches
+        downstream. The flag only controls whether we *also* synthesize a
+        new InterruptionFrame:
+        - explicit-InterruptionFrame branch: no synthesis (the re-emit
+          already covers it; synthesizing would push two).
+        - VAD-driven branch: synthesize, because the original is a
+          VADUserStartedSpeakingFrame which downstream TTS/transport
+          don't react to as an interrupt signal.
         """
         self._cancel_flush()
         self._transcript_buffer.clear()
@@ -176,8 +183,12 @@ class StateMachineProcessor(FrameProcessor):
             if not self._transcript_buffer:
                 return
             combined = " ".join(self._transcript_buffer)
-            self._transcript_buffer.clear()
+            # Submit BEFORE clearing — `submit_transcript` is sync today and
+            # can't raise, but a future raise (closed queue, refactor) would
+            # otherwise drop the buffered text on the floor. Submit-then-clear
+            # means a raise leaves the buffer intact for the next flush.
             self._runner.submit_transcript(combined)
+            self._transcript_buffer.clear()
         finally:
             # Clear the reference so a late-arriving transcript (Deepgram
             # lagged past the VAD-stopped grace) can schedule a fresh flush.

@@ -47,13 +47,18 @@ _DEFAULT_BENEFITS_LOG_PATH = "benefits.jsonl"
 tmp file). Path is gitignored at the default location."""
 
 
-def _append_benefits_record(session: CallSession) -> None:
+async def _append_benefits_record(session: CallSession) -> None:
     """Write one JSONL entry for this completed call: call_sid,
     completion_reason, patient identifiers, extracted benefits, UTC
     timestamp. JSONL (vs. a single JSON array) because append is a single
     write — no read-modify-write race when multiple calls finish close
-    together. Failures are logged but never raised — logging is
-    best-effort and must not affect call teardown.
+    together.
+
+    These records are the call deliverable, so failures log at `error`,
+    not `warning` — but never raise: best-effort logging must not affect
+    call teardown. The actual file write is dispatched to a worker thread
+    via `asyncio.to_thread` so a slow disk doesn't block the asyncio loop
+    (which would back-pressure every other processor in the pipeline).
     """
     path = Path(os.environ.get("BENEFITS_LOG_PATH", _DEFAULT_BENEFITS_LOG_PATH))
     record = {
@@ -66,10 +71,33 @@ def _append_benefits_record(session: CallSession) -> None:
         "mode_at_completion": session.mode,
     }
     try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        # Serialize FIRST so a non-JSON-serializable field (e.g. a future
+        # model gains a `datetime`) surfaces as a log line, not a half-
+        # written file with a torn JSONL row that breaks every reader.
+        line = json.dumps(record) + "\n"
+    except (TypeError, ValueError) as exc:
+        log.error(
+            "benefits_record_serialize_failed",
+            call_sid=session.call_sid,
+            error_class=type(exc).__name__,
+            error=str(exc),
+        )
+        return
+    try:
+        await asyncio.to_thread(_write_jsonl_line, path, line)
     except OSError as exc:
-        log.warning("benefits_log_write_failed", path=str(path), error=str(exc))
+        log.error(
+            "benefits_record_write_failed",
+            call_sid=session.call_sid,
+            path=str(path),
+            error_class=type(exc).__name__,
+            error=str(exc),
+        )
+
+
+def _write_jsonl_line(path: Path, line: str) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line)
 
 
 # After 2 IVR turns where no tool advanced call state, terminate. Distinct
@@ -81,15 +109,13 @@ REP_STUCK_LIMIT = 2
 
 
 class IVRLLMClient(Protocol):
-    """Tool-calling LLM for IVR mode. Real Groq implementation lands as a
-    follow-up; tests inject `FakeIVRLLMClient`."""
+    """Tool-calling LLM for IVR mode. Production: `GroqToolCallingClient`.
+    Tests inject `FakeIVRLLMClient`."""
 
     async def complete_with_tools(
         self,
         system: str,
         history: list[Turn],
-        # TODO(D1.5): replace `dict[str, Any]` with the Groq tool-schema TypedDict
-        # once the real client lands.
         tools: list[dict[str, Any]],
         temperature: float = 0.1,
     ) -> IVRTurnResponse: ...
@@ -155,12 +181,23 @@ class CallSessionRunner:
 
     def submit_transcript(self, text: str) -> None:
         """Non-blocking enqueue with drop-oldest on full. Stale transcripts
-        are worthless — keep the newest."""
+        are worthless when they're partial fragments — but the upstream
+        VAD-driven flush hands us whole-menu aggregates, so an eviction
+        now drops a complete IVR menu the LLM never gets to see. Log
+        loudly when it happens so a "the agent silently skipped a menu"
+        symptom is greppable.
+        """
         try:
             self.in_queue.put_nowait(text)
         except asyncio.QueueFull:
+            evicted: str | None = None
             with contextlib.suppress(asyncio.QueueEmpty):
-                _ = self.in_queue.get_nowait()
+                evicted = self.in_queue.get_nowait()
+            log.warning(
+                "transcript_dropped_queue_full",
+                evicted_preview=evicted[:120] if evicted else None,
+                new_preview=text[:120],
+            )
             self.in_queue.put_nowait(text)
 
     def mark_interrupted(self) -> None:
@@ -231,7 +268,7 @@ class CallSessionRunner:
                     reason=self.session.completion_reason,
                     benefits=self.session.benefits.model_dump(),
                 )
-                _append_benefits_record(self.session)
+                await _append_benefits_record(self.session)
                 return
 
     @observe(name="call_turn")

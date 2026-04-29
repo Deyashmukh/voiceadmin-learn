@@ -48,8 +48,9 @@ CompleteCallReason = Literal["benefits_extracted", "ivr_dead_end", "user_hangup"
 
 
 class SendDTMFArgs(BaseModel):
-    # Restrict to the DTMF wire alphabet — `<Play digits>` only accepts these.
-    # Bounds to a real menu's worth of input (member ID + #/*); 20 is generous.
+    # Restrict to the DTMF wire alphabet — these are the only tones the
+    # carrier recognizes regardless of how we render them. Bounds to a real
+    # menu's worth of input (member ID + #/*); 20 is generous.
     digits: str = Field(min_length=1, max_length=20, pattern=r"^[0-9*#]+$")
 
 
