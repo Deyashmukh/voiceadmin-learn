@@ -471,6 +471,37 @@ async def test_call_actuator_without_twilio_client_rejects_dtmf(make_session: Ma
         await actuator.execute(DTMFIntent(digits="1"))
 
 
+async def test_call_actuator_dispatches_dtmf_via_send_digits(make_session: MakeSession):
+    """Live-call DTMF path: actuator forwards `(twilio_client, call_sid, digits)`
+    to `send_digits`. Locks the call-arity boundary — a regression that swaps
+    args silently breaks IVR navigation in production calls."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    session = make_session()
+    out_queue: asyncio.Queue[str] = asyncio.Queue()
+    twilio_client = MagicMock()
+    actuator = CallActuator(session=session, out_queue=out_queue, twilio_client=twilio_client)
+
+    with patch("agent.actuator.send_digits", new_callable=AsyncMock) as send_mock:
+        await actuator.execute(DTMFIntent(digits="123"))
+
+    send_mock.assert_awaited_once_with(twilio_client, session.call_sid, "123")
+
+
+async def test_call_actuator_hangup_is_noop(make_session: MakeSession):
+    """`HangupIntent` is a no-op at the actuator boundary — termination flows
+    through `session.completion_reason`, not through actuator I/O. Lock the
+    no-op so a future change that adds Twilio-side hangup doesn't accidentally
+    fire on every call's HangupIntent."""
+    from agent.schemas import HangupIntent
+
+    session = make_session()
+    out_queue: asyncio.Queue[str] = asyncio.Queue()
+    actuator = CallActuator(session=session, out_queue=out_queue, twilio_client=None)
+    await actuator.execute(HangupIntent())  # must not raise; must not enqueue
+    assert out_queue.empty()
+
+
 # --- Rep-mode turn handler (D2) -------------------------------------------
 
 
