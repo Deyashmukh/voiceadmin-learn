@@ -10,9 +10,8 @@ import os
 from dataclasses import dataclass
 from typing import Protocol
 
-# Re-exported from agent.errors so existing
-# `from agent.telephony.dialer import DestinationNotAllowedError`
-# imports keep working after the taxonomy unification.
+# Re-exported so `from agent.telephony.dialer import DestinationNotAllowedError`
+# continues to resolve; the canonical definition lives in `agent.errors`.
 from agent.errors import DestinationNotAllowedError as DestinationNotAllowedError
 
 
@@ -50,7 +49,10 @@ def _load_allowlist(raw: str | None) -> frozenset[str]:
 
 def check_destination(to: str, allowlist: frozenset[str]) -> None:
     if to not in allowlist:
-        raise DestinationNotAllowedError(f"Destination {to!r} is not in ALLOWED_DESTINATIONS")
+        raise DestinationNotAllowedError(
+            f"Destination {to!r} is not in ALLOWED_DESTINATIONS",
+            destination=to,
+        )
 
 
 def dial(

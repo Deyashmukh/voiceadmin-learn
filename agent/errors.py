@@ -18,11 +18,21 @@ from __future__ import annotations
 
 from typing import Literal
 
-# Mirrors the `kind` discriminator on `SideEffectIntent` in `agent.schemas`.
-# Defined here as a Literal alias rather than imported to keep the error
-# module standalone — `agent.schemas` will import from `agent.errors` once
-# the M8'/E2 migration lands, and the cycle is easier avoided than fixed.
-IntentKind = Literal["speak", "dtmf", "hangup"]
+from agent.schemas import IntentKind, ToolName
+
+# Anthropic-style stop reasons surfaced via Claude's `messages.parse()`.
+# `unknown` is the escape hatch for the `getattr(..., "stop_reason", "unknown")`
+# fallback in the rep client — and for any future provider whose stop_reason
+# set we don't recognise. Pinning the literal keeps log/dashboard aggregations
+# clean instead of grouping on typos.
+LLMStopReason = Literal[
+    "end_turn",
+    "max_tokens",
+    "stop_sequence",
+    "tool_use",
+    "refusal",
+    "unknown",
+]
 
 
 class AgentError(Exception):
@@ -33,20 +43,32 @@ class ConfigurationError(AgentError):
     """Missing or invalid wiring — env vars, dependency injection, etc.
 
     Raised at construction time so a misconfigured deployment dies before
-    audio starts flowing, not several seconds into a live call.
+    audio starts flowing, not several seconds into a live call. `setting`
+    names the offending env var or DI parameter so operators don't have
+    to grep the message.
     """
+
+    def __init__(self, message: str, *, setting: str) -> None:
+        super().__init__(message)
+        self.setting = setting
 
 
 class LLMRefusalError(AgentError):
     """The LLM declined to answer or returned unparseable output.
 
-    Carries `stop_reason` and `response_id` so dashboards (Langfuse, log
-    aggregators) can correlate the failure to the underlying provider
-    trace. Callers may choose to retry with a different prompt or
-    surface the refusal as a `completion_reason`.
+    Carries `stop_reason` and `response_id` so dashboards can correlate
+    the failure to the underlying provider trace. Callers may choose to
+    retry with a different prompt or surface the refusal as a
+    `completion_reason`.
     """
 
-    def __init__(self, message: str, *, stop_reason: str, response_id: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        stop_reason: LLMStopReason,
+        response_id: str,
+    ) -> None:
         super().__init__(message)
         self.stop_reason = stop_reason
         self.response_id = response_id
@@ -55,15 +77,15 @@ class LLMRefusalError(AgentError):
 class ToolDispatchError(AgentError):
     """An exception escaped the tool dispatcher's handler.
 
-    Validation rejections are NOT this — they return a `ToolResult`.
-    This is for unhandled exceptions in `_dispatch_*` helpers, which the
-    runner converts to a `tool_dispatch_exception` completion reason.
-    `tool_name` lets the runner attribute the failure without parsing the
-    message; `None` is acceptable for cases where the tool name itself
-    couldn't be resolved (e.g. malformed dispatch frame).
+    Validation rejections are NOT this — they return a `ToolResult`. This
+    is for unhandled exceptions in the dispatch handlers, which the
+    runner converts to a structured completion reason. `tool_name`
+    attributes the failure without parsing the message; `None` is
+    accepted for the rare malformed-frame case where the tool name
+    couldn't be resolved.
     """
 
-    def __init__(self, message: str, *, tool_name: str | None = None) -> None:
+    def __init__(self, message: str, *, tool_name: ToolName | None = None) -> None:
         super().__init__(message)
         self.tool_name = tool_name
 
@@ -71,9 +93,10 @@ class ToolDispatchError(AgentError):
 class ActuatorError(AgentError):
     """The actuator could not execute a side-effect intent.
 
-    `intent_kind` identifies which `SideEffectIntent` variant failed so
-    logs can attribute the failure without parsing the message. Typed as
-    a Literal so a wrong value fails type-check at the raise site.
+    `intent_kind` (typed against the canonical `SideEffectIntent.kind`
+    discriminator from `agent.schemas`) lets logs attribute the failure
+    without parsing the message and fails type-check at the raise site
+    if a wrong value is passed.
     """
 
     def __init__(self, message: str, *, intent_kind: IntentKind) -> None:
@@ -85,6 +108,11 @@ class DestinationNotAllowedError(AgentError):
     """Outbound dial blocked by the `ALLOWED_DESTINATIONS` fence.
 
     The fence is non-negotiable: a typo in a Twilio env var must never
-    be able to reach a real phone. This error surfaces only when the
-    target number is genuinely outside the allowlist.
+    be able to reach a real phone. `destination` is the offending
+    number, surfaced as a structured field so log aggregators can group
+    blocked-dial events without parsing the message.
     """
+
+    def __init__(self, message: str, *, destination: str) -> None:
+        super().__init__(message)
+        self.destination = destination
