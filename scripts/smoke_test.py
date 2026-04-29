@@ -56,12 +56,29 @@ def smoke_elevenlabs() -> str:
     return f"OK — {len(voices.voices)} voice(s)"
 
 
+def smoke_anthropic() -> str:
+    # Sync client over `messages.create` is enough — we're verifying credentials
+    # + billing, not the async / `messages.parse` path the rep client uses.
+    from anthropic import Anthropic
+
+    client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    r = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=10,
+        messages=[{"role": "user", "content": "Say 'pong' and nothing else."}],
+    )
+    text_block = next((b for b in r.content if b.type == "text"), None)
+    text = (text_block.text if text_block else "").strip()
+    return f"OK — {text[:40]!r}"
+
+
 for name, fn in [
     ("twilio", smoke_twilio),
     ("groq/qwen3-32b", lambda: smoke_groq_model("qwen/qwen3-32b")),
     ("groq/llama-4-scout", lambda: smoke_groq_model("meta-llama/llama-4-scout-17b-16e-instruct")),
     ("deepgram", smoke_deepgram),
     ("elevenlabs", smoke_elevenlabs),
+    ("anthropic/haiku-4-5", smoke_anthropic),
 ]:
     try:
         results[name] = fn()
