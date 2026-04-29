@@ -25,6 +25,7 @@ dev = [
     "pyright==1.1.408",
     "pytest==9.0.3",
     "pytest-asyncio==1.3.0",
+    "pytest-cov==7.0.0",
     "ruff==0.15.11",
 ]
 
@@ -46,4 +47,22 @@ exclude = [".venv", "**/__pycache__"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-q"
+# `--cov-fail-under` enforces the floor in CI; `--no-cov-on-fail` keeps the
+# report visible when tests fail so we can debug without hunting for the
+# coverage section.
+addopts = "-q --cov=agent --cov-report=term-missing --cov-fail-under=90 --no-cov-on-fail"
+
+[tool.coverage.run]
+source = ["agent"]
+# `agent/main.py` is the FastAPI + Pipecat entrypoint — exercised by live
+# phone calls (M7'), not unit tests. Including it would tank the coverage
+# floor for code that's intentionally not unit-tested.
+omit = ["agent/main.py"]
+
+[tool.coverage.report]
+# Fail on missing branches in covered files (skip omitted ones).
+show_missing = true
+skip_empty = true
+# Per-file thresholds aren't built into coverage; the global floor + the
+# per-file `Missing` columns in `term-missing` make gaps visible enough
+# for review. Tighten via PR review when a file drops below ~85%.
