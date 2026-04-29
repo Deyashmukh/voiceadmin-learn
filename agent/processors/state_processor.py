@@ -30,21 +30,27 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from agent.call_session import CallSessionRunner
 from agent.logging_config import log
 
-_TRANSCRIPT_DEBOUNCE_S = 2.5
-"""Quiet window after the last transcript before flushing the buffered text as
-a single turn. IVR menus arrive as 3-5 separate Deepgram finals (one per
-sentence with natural pauses between them); without aggregation each becomes
+_IVR_DEBOUNCE_S = 2.5
+"""Quiet window in IVR mode. Payer IVR menus arrive as 3-5 separate Deepgram
+finals (one per option, with natural pauses); without aggregation each becomes
 its own LLM turn and the agent reacts to fragments. 2.5s spans the typical
-inter-sentence pause in a recorded payer IVR menu, while still feeling
-responsive once the menu finishes."""
+inter-option pause in a recorded menu."""
+
+_REP_DEBOUNCE_S = 0.6
+"""Quiet window in rep mode. A human rep speaks in single utterances with
+short breath-pauses; 0.6s catches the natural end-of-turn without making the
+agent feel sluggish. Aggressive but ergonomic."""
 
 
 class StateMachineProcessor(FrameProcessor):
     """Bridge Pipecat frames to the call session runner.
 
     - Finalized `TranscriptionFrame`s are buffered and flushed as a single
-      submission once the speaker has been quiet for `_TRANSCRIPT_DEBOUNCE_S`.
-    - `UserStartedSpeakingFrame` / `InterruptionFrame` cancel the in-flight turn.
+      submission once the speaker has been quiet (mode-aware: long for IVR
+      menus, short for rep conversation).
+    - `UserStartedSpeakingFrame` / `InterruptionFrame` cancel the in-flight
+      turn AND propagate `InterruptionFrame` downstream so Pipecat's TTS
+      and output transport stop synthesizing / streaming any tail audio.
     - Responses from `runner.out_queue` are pushed downstream as `TTSSpeakFrame`s.
     - The runner's lifecycle is pinned to `StartFrame` / `EndFrame` / `CancelFrame`.
     """
@@ -53,7 +59,8 @@ class StateMachineProcessor(FrameProcessor):
         self,
         runner: CallSessionRunner,
         *,
-        transcript_debounce_s: float = _TRANSCRIPT_DEBOUNCE_S,
+        ivr_debounce_s: float = _IVR_DEBOUNCE_S,
+        rep_debounce_s: float = _REP_DEBOUNCE_S,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)  # pyright: ignore[reportUnknownMemberType] (Pipecat stub gap)
@@ -61,7 +68,8 @@ class StateMachineProcessor(FrameProcessor):
         self._pump_task: asyncio.Task[None] | None = None
         self._transcript_buffer: list[str] = []
         self._flush_task: asyncio.Task[None] | None = None
-        self._transcript_debounce_s = transcript_debounce_s
+        self._ivr_debounce_s = ivr_debounce_s
+        self._rep_debounce_s = rep_debounce_s
         # Tracks whether the agent's TTS is currently being played to the
         # caller. Barge-in (VAD-driven interrupt) is only meaningful while
         # the agent is talking — VAD fires on every breath pause during a
@@ -86,9 +94,7 @@ class StateMachineProcessor(FrameProcessor):
         elif isinstance(frame, InterruptionFrame):
             # Explicit InterruptionFrame is unconditional — caller has
             # decided this is a real interrupt.
-            self._cancel_flush()
-            self._transcript_buffer.clear()
-            self._runner.mark_interrupted()
+            await self._handle_barge_in(downstream_interruption=False)
         elif (
             isinstance(frame, (UserStartedSpeakingFrame, VADUserStartedSpeakingFrame))
             and self._bot_speaking
@@ -97,18 +103,41 @@ class StateMachineProcessor(FrameProcessor):
             # speaking. Otherwise this is just the caller talking to the
             # IVR with normal inter-sentence pauses and we should NOT drop
             # the buffered transcripts.
-            self._cancel_flush()
-            self._transcript_buffer.clear()
-            self._runner.mark_interrupted()
+            await self._handle_barge_in(downstream_interruption=True)
 
         await self.push_frame(frame, direction)
 
+    async def _handle_barge_in(self, *, downstream_interruption: bool) -> None:
+        """Cancel the in-flight runner turn and (optionally) push an
+        InterruptionFrame downstream so Pipecat's TTS service stops
+        mid-synthesis and the output transport clears any buffered audio.
+
+        Without the downstream propagation, mark_interrupted only stops
+        the runner from generating *new* turns — bytes already queued
+        in the WSS output buffer keep playing and the user keeps hearing
+        the agent for a beat after they barged in.
+
+        `downstream_interruption=False` for the explicit-InterruptionFrame
+        branch because we'll already re-emit the original frame downstream
+        on the way out of `process_frame`.
+        """
+        self._cancel_flush()
+        self._transcript_buffer.clear()
+        self._runner.mark_interrupted()
+        if downstream_interruption:
+            await self.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+
     def _buffer_transcript(self, text: str) -> None:
-        """Append a finalized transcript and (re)arm the debounce timer."""
+        """Append a finalized transcript and (re)arm the debounce timer.
+
+        Mode-aware: IVR menus need a long quiet window to aggregate; rep
+        conversation needs a short one so the agent doesn't feel sluggish.
+        """
         self._transcript_buffer.append(text)
         self._cancel_flush()
+        delay = self._ivr_debounce_s if self._runner.session.mode == "ivr" else self._rep_debounce_s
         self._flush_task = asyncio.create_task(
-            self._flush_after_quiet(self._transcript_debounce_s),
+            self._flush_after_quiet(delay),
             name="state-processor-debounce",
         )
 

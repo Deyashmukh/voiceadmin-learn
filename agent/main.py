@@ -53,30 +53,38 @@ app = FastAPI()
 # Twilio μ-law at 8kHz. Override via env if you rewire the stream.
 TWILIO_SAMPLE_RATE = int(os.getenv("TWILIO_SAMPLE_RATE", "8000"))
 
-_IVR_SYSTEM_PROMPT = (
+_IVR_SYSTEM_PROMPT_TEMPLATE = (
     "You are a provider's-office agent calling a payer's IVR to verify "
-    "patient eligibility. The user message you receive is one complete IVR "
-    "utterance — typically a menu listing several numbered options, or a "
-    "prompt asking for information. Treat it as input, NOT something to "
-    "echo back. Every action is exactly one tool call; never reply in "
-    "natural language.\n"
+    "eligibility benefits for the patient below. The user message you "
+    "receive is one complete IVR utterance — typically a menu listing "
+    "numbered options, a prompt asking for information, or (when a human "
+    "rep cuts in early) a conversational greeting. Treat it as input, "
+    "NOT something to echo back. Every action is exactly one tool call; "
+    "never reply in natural language.\n"
     "\n"
-    "Goal: navigate the IVR to verify member benefits, providing requested "
-    "patient details, and accept a transfer to a representative.\n"
+    "Patient on this call:\n"
+    "- Name: {patient_name}\n"
+    "- Member ID: {member_id}\n"
+    "- Date of birth: {patient_dob}\n"
+    "Use these EXACT values when the IVR asks for patient identifiers. "
+    "Never invent or substitute other digits or names.\n"
     "\n"
     "How to act on each turn:\n"
-    "- One IVR utterance = one menu (or one prompt) = one tool call from you.\n"
-    "- If the utterance lists numbered options ('press 1 for X, press 2 for "
-    "Y, press 3 for Z'), pick the SINGLE digit that best advances the goal "
-    "and call `send_dtmf` with just that one digit. The IVR will play the "
-    "next menu after you press; that next menu will arrive as a new turn.\n"
-    "- If the utterance asks for information (member ID, DOB, patient name), "
-    "call `speak` with ONLY that data — no preamble, no acknowledgement.\n"
-    "- If the utterance is reading benefit details, call `record_benefit` to "
-    "capture them.\n"
-    "- If the utterance signals a handoff ('one moment', 'connecting you', "
-    "'please hold'), call `transfer_to_rep`.\n"
-    "- If the call is over ('thank you, goodbye'), call `complete_call`.\n"
+    "- One IVR utterance = one menu (or prompt) = one tool call.\n"
+    "- Numbered options ('press 1 for X, press 2 for Y'): call `send_dtmf` "
+    "with the SINGLE digit that best advances eligibility verification. "
+    "The next menu arrives as a new turn.\n"
+    "- A request for information (member ID, DOB, patient name): call "
+    "`speak` with ONLY the literal value from the patient block above — "
+    "no preamble, no acknowledgement.\n"
+    "- Benefit details being read aloud: call `record_benefit`.\n"
+    "- Handoff cue ('one moment', 'connecting you', 'please hold'): call "
+    "`transfer_to_rep`.\n"
+    "- A conversational utterance that does NOT match a menu/prompt format "
+    "(e.g. 'Hello, how can I help you?', 'Hi, this is Sarah'): a human rep "
+    "has cut in early. Call `transfer_to_rep` IMMEDIATELY — do not press "
+    "digits at a human.\n"
+    "- 'Thank you, goodbye'-style closing: call `complete_call`.\n"
     "- Only call `fail_with_reason` when the IVR is truly stuck (silent or "
     "looping with no usable options).\n"
     "\n"
@@ -103,6 +111,14 @@ def _default_patient() -> PatientInfo:
 
 def _rep_system_prompt(patient: PatientInfo) -> str:
     return _REP_PROMPT_TEMPLATE.format(
+        patient_name=f"{patient.first_name} {patient.last_name}",
+        member_id=patient.member_id,
+        patient_dob=patient.dob,
+    )
+
+
+def _ivr_system_prompt(patient: PatientInfo) -> str:
+    return _IVR_SYSTEM_PROMPT_TEMPLATE.format(
         patient_name=f"{patient.first_name} {patient.last_name}",
         member_id=patient.member_id,
         patient_dob=patient.dob,
@@ -179,7 +195,7 @@ async def ws(websocket: WebSocket) -> None:
         ivr_llm=ivr_llm,
         rep_llm=rep_llm,
         tool_dispatcher=tools.dispatch,
-        ivr_system_prompt=_IVR_SYSTEM_PROMPT,
+        ivr_system_prompt=_ivr_system_prompt(patient),
         rep_system_prompt=_rep_system_prompt(patient),
         tools=tools.groq_tool_schemas(),
         twilio_client=_twilio_rest_client(),

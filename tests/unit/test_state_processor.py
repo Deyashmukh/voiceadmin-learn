@@ -54,7 +54,8 @@ class _SinkProcessor(FrameProcessor):
 async def _make_processor(
     make_session: Callable[..., CallSession],
     ivr_responses: list[IVRTurnResponse] | None = None,
-    transcript_debounce_s: float = 0.0,
+    ivr_debounce_s: float = 0.0,
+    rep_debounce_s: float = 0.0,
 ) -> tuple[StateMachineProcessor, CallSessionRunner, _SinkProcessor]:
     session = make_session()
     ivr_llm = FakeIVRLLMClient(responses=list(ivr_responses or []))
@@ -69,12 +70,13 @@ async def _make_processor(
         actuator=FakeActuator(),
     )
     # Default 0s debounce so transcripts flush immediately and assertions
-    # don't have to budget for the production 2.5s wait. The dedicated
-    # debounce test overrides to a small positive value.
+    # don't have to budget for the production wait. The dedicated debounce
+    # tests override to a small positive value.
     proc = StateMachineProcessor(
         runner,
         enable_direct_mode=True,
-        transcript_debounce_s=transcript_debounce_s,
+        ivr_debounce_s=ivr_debounce_s,
+        rep_debounce_s=rep_debounce_s,
     )
     sink = _SinkProcessor()
     proc.link(sink)
@@ -158,7 +160,7 @@ async def test_transcripts_are_debounced_into_one_submission(make_session: MakeS
     No StartFrame here — we want to inspect what `submit_transcript` receives
     without the consumer immediately draining `in_queue`.
     """
-    proc, runner, _ = await _make_processor(make_session, transcript_debounce_s=0.05)
+    proc, runner, _ = await _make_processor(make_session, ivr_debounce_s=0.05)
     await proc.process_frame(_transcription("Press 1 for benefits."), FrameDirection.DOWNSTREAM)
     await proc.process_frame(_transcription("Press 2 for claims."), FrameDirection.DOWNSTREAM)
     await proc.process_frame(_transcription("Press 9 for a rep."), FrameDirection.DOWNSTREAM)
@@ -217,6 +219,34 @@ async def test_vad_speech_start_only_interrupts_while_bot_speaking(
         await runner.out_queue.put("stale-2")
         await proc.process_frame(vad_frame, FrameDirection.DOWNSTREAM)
         assert not runner.out_queue.empty()
+    finally:
+        await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+
+
+async def test_vad_barge_in_pushes_interruption_frame_downstream(
+    make_session: MakeSession,
+):
+    """When VAD-gated barge-in fires, an `InterruptionFrame` must be pushed
+    downstream so Pipecat's TTS service stops mid-synthesis and the output
+    transport drops any buffered audio. Without this, the agent keeps
+    talking over the user for several beats after the interrupt is logged.
+    """
+    proc, runner, sink = await _make_processor(make_session)
+    try:
+        await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+        await proc.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        # Two InterruptionFrames reach the sink: the one we synthesized
+        # for the downstream TTS-clear, plus the original VAD frame as it
+        # passes through (push_frame at the end of process_frame). We
+        # assert at least one InterruptionFrame is present.
+        assert any(isinstance(f, InterruptionFrame) for f in sink.received), (
+            f"expected InterruptionFrame in {[type(f).__name__ for f in sink.received]}"
+        )
+        # Also re-assert the runner side: queues drained.
+        await runner.out_queue.put("would-be-stale")
+        await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        assert runner.out_queue.empty()
     finally:
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
