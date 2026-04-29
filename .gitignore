@@ -38,3 +38,6 @@ venv/
 
 # Langfuse data (if self-hosted in repo)
 langfuse-data/
+
+# Per-call benefits log (live-test artifacts; override path with BENEFITS_LOG_PATH)
+benefits.jsonl

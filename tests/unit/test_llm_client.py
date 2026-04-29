@@ -1,11 +1,23 @@
-"""Unit tests for M5'/C: Anthropic rep-LLM client + the FakeAnthropicRepClient
-seam. Zero network — the SDK call sites are mocked."""
+"""Unit tests for the Anthropic rep-LLM client + the FakeAnthropicRepClient
+seam, plus the GroqToolCallingClient. Zero network — the SDK call sites
+are mocked."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from groq import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+    UnprocessableEntityError,
+)
 
 from agent.errors import ConfigurationError, LLMRefusalError
 from agent.llm_client import (
@@ -202,8 +214,8 @@ async def test_complete_structured_extracts_usage_from_response(rep_output: RepT
 
 async def test_complete_structured_propagates_cancellation(rep_output: RepTurnOutput):
     """A CancelledError raised on the in-flight SDK call must propagate, not
-    leave the session in a half-mutated state. The IVR/rep turn handlers in
-    M5'/D depend on this for barge-in cancellation to actually abort the LLM."""
+    leave the session in a half-mutated state. The IVR/rep turn handlers
+    depend on this for barge-in cancellation to actually abort the LLM."""
     import asyncio
 
     async def _slow_parse(*_args: object, **_kwargs: object):
@@ -274,7 +286,7 @@ async def test_fake_rejects_schema_mismatch(rep_output: RepTurnOutput):
 
 
 async def test_fake_slow_mode_delays_response(rep_output: RepTurnOutput):
-    """Used by M5'/D1 to simulate a slow LLM for barge-in cancellation tests."""
+    """Used to simulate a slow LLM for barge-in cancellation tests."""
     import asyncio
     import time
 
@@ -402,10 +414,82 @@ async def test_groq_client_passes_call_args_to_sdk():
     await client.complete_with_tools(system="sys", history=[], tools=[{"x": 1}], temperature=0.2)
     kwargs = create_mock.call_args.kwargs
     assert kwargs["model"] == IVR_MODEL
-    assert kwargs["tool_choice"] == "auto"
+    assert kwargs["tool_choice"] == "required"
     assert kwargs["temperature"] == 0.2
     assert kwargs["tools"] == [{"x": 1}]
     assert kwargs["max_tokens"] == 512
+
+
+def _groq_client_raising(exc: Exception) -> GroqToolCallingClient:
+    """Build a Groq client whose `chat.completions.create` raises `exc`. Used
+    to pin the consumer-survival contract: provider-side errors must be
+    swallowed; everything else must propagate so misconfigs surface."""
+    create_mock = AsyncMock(side_effect=exc)
+    fake_completions = MagicMock(create=create_mock)
+    fake_chat = MagicMock(completions=fake_completions)
+    fake_async = MagicMock(chat=fake_chat)
+    return GroqToolCallingClient(client=fake_async)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BadRequestError(
+            "tool_use_failed",
+            response=MagicMock(status_code=400),
+            body={"error": {"code": "tool_use_failed"}},
+        ),
+        UnprocessableEntityError(
+            "unprocessable",
+            response=MagicMock(status_code=422),
+            body={"error": {}},
+        ),
+        APIConnectionError(request=MagicMock()),
+        APITimeoutError(request=MagicMock()),
+        RateLimitError("slow down", response=MagicMock(status_code=429), body={"error": {}}),
+        InternalServerError("groq down", response=MagicMock(status_code=500), body={"error": {}}),
+    ],
+    ids=[
+        "bad_request",
+        "unprocessable",
+        "connection_error",
+        "timeout",
+        "rate_limit",
+        "internal_server",
+    ],
+)
+async def test_groq_client_degrades_provider_errors_to_empty_response(exc: Exception):
+    """Provider-side input rejection (4xx tool errors) AND transient provider
+    conditions (rate-limit, 5xx, network blip) must NOT kill the call-session
+    consumer. Returning an empty IVRTurnResponse counts as a no-progress turn —
+    the watchdog handles persistent failure. Locks the consumer-survival
+    contract; a regression that re-raises here would crash a live call
+    mid-turn over a single 429."""
+    client = _groq_client_raising(exc)
+    result = await client.complete_with_tools(system="x", history=[], tools=[])
+    assert result.tool_calls == []
+    assert result.text == ""
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        AuthenticationError("bad key", response=MagicMock(status_code=401), body={"error": {}}),
+        PermissionDeniedError("no perms", response=MagicMock(status_code=403), body={"error": {}}),
+        NotFoundError("model gone", response=MagicMock(status_code=404), body={"error": {}}),
+        TypeError("programmer bug"),
+    ],
+    ids=["auth", "permission", "not_found", "type_error"],
+)
+async def test_groq_client_propagates_misconfig_and_real_bugs(exc: Exception):
+    """Genuine misconfigs (bad key, wrong workspace, retired model id) and
+    non-`APIError` exceptions (programmer bugs, schema drift) must propagate
+    so they surface immediately instead of being masked by the watchdog
+    after two wasted turns. Transient conditions (rate-limit, 5xx, timeout)
+    are NOT in this list — see the degrade test."""
+    client = _groq_client_raising(exc)
+    with pytest.raises(type(exc)):
+        await client.complete_with_tools(system="x", history=[], tools=[])
 
 
 # --- _history_to_groq_messages tests ---------------------------------------

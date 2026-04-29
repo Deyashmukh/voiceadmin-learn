@@ -6,16 +6,19 @@ out_queue natively, so tests can read spoken text from there directly."""
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NoReturn
 
 import pytest
 import structlog.contextvars
+import structlog.testing
 
 from agent import tools
 from agent.actuator import Actuator, CallActuator
 from agent.call_session import CallSessionRunner, ToolDispatcher
-from agent.errors import ActuatorError
 from agent.schemas import (
     Benefits,
     CallSession,
@@ -70,17 +73,184 @@ def _build_runner(
 
 async def test_submit_transcript_drops_oldest_when_full(make_session: MakeSession):
     runner, _, _ = _build_runner(make_session())
-    for i in range(15):
-        runner.submit_transcript(f"item-{i}")
+    with structlog.testing.capture_logs() as captured:
+        for i in range(15):
+            runner.submit_transcript(f"item-{i}")
     assert runner.in_queue.qsize() == 8
     drained: list[str] = []
     while not runner.in_queue.empty():
         drained.append(runner.in_queue.get_nowait())
     assert drained[-1] == "item-14"
     assert "item-0" not in drained
+    # Each eviction must surface as a `transcript_dropped_queue_full` warning
+    # (the "agent silently skipped a menu" greppability contract). 15 puts
+    # against an 8-slot queue → 7 evictions.
+    eviction_events = [
+        e
+        for e in captured
+        if e.get("event") == "transcript_dropped_queue_full" and e.get("log_level") == "warning"
+    ]
+    assert len(eviction_events) == 7, (
+        f"expected 7 warning-level transcript_dropped_queue_full events, got {len(eviction_events)}"
+    )
 
 
 # --- IVR turn happy path ----------------------------------------------------
+
+
+async def test_call_completion_appends_jsonl_record(make_session: MakeSession):
+    """One JSONL line per completed call — regardless of mode. Captures the
+    call_sid, completion_reason, patient identifiers, and final benefits.
+    `BENEFITS_LOG_PATH` is redirected to a tmp file by the autouse fixture
+    in conftest, so this assertion reads back exactly what the runner just
+    wrote."""
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+        )
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("Thank you, goodbye.")
+        # Wait for the consumer to finish (not just for `session.done` to
+        # flip) — JSONL write happens AFTER `session.done` is set, via
+        # `asyncio.to_thread`, and the consumer only exits once the write
+        # returns. Cancelling mid-write would leave the file unwritten.
+        await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await runner.stop()
+    log_path = Path(os.environ["BENEFITS_LOG_PATH"])
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["call_sid"] == runner.session.call_sid
+    assert record["completion_reason"] == "benefits_extracted"
+    assert record["patient"]["member_id"] == runner.session.patient.member_id
+    assert "benefits" in record
+    assert "completed_at" in record
+
+
+async def test_jsonl_append_does_not_overwrite_prior_calls(make_session: MakeSession):
+    """JSONL was chosen over a single-array file precisely so back-to-back
+    completions don't race read-modify-write. Two calls must produce two
+    distinct lines, both readable. Catches a regression where someone
+    flips `"a"` to `"w"` on the file open and silently drops history."""
+
+    async def _run_one_completed_call(sid: str) -> None:
+        session = make_session()
+        session.call_sid = sid
+        runner, ivr_llm, _rep = _build_runner(session, actuator=FakeActuator())
+        ivr_llm.responses = [
+            IVRTurnResponse(
+                tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+            )
+        ]
+        try:
+            await runner.start()
+            runner.submit_transcript("Thank you, goodbye.")
+            # Wait for the consumer to actually finish — see the equivalent
+            # comment in test_call_completion_appends_jsonl_record.
+            await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+        finally:
+            await runner.stop()
+
+    await _run_one_completed_call("CA-call-A")
+    await _run_one_completed_call("CA-call-B")
+    log_path = Path(os.environ["BENEFITS_LOG_PATH"])
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 2, f"expected 2 entries, got {len(lines)}"
+    sids = {json.loads(line)["call_sid"] for line in lines}
+    assert sids == {"CA-call-A", "CA-call-B"}, f"expected both sids, got {sids}"
+
+
+async def test_jsonl_write_failure_does_not_abort_call(
+    make_session: MakeSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Best-effort logging contract: a failed write must not propagate into
+    call teardown, AND it must surface in the logs. Without the log assertion
+    a refactor that swapped `except OSError:` to `except Exception: pass`
+    would silently drop benefits records and pass this test.
+
+    Uses `structlog.testing.capture_logs` to assert the
+    `benefits_record_write_failed` event fires at error level — the contract
+    is "best-effort, but observable", not "best-effort and silent".
+    """
+    monkeypatch.setenv("BENEFITS_LOG_PATH", str(tmp_path / "missing-dir" / "benefits.jsonl"))
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+        )
+    ]
+    with structlog.testing.capture_logs() as captured:
+        try:
+            await runner.start()
+            runner.submit_transcript("Thank you, goodbye.")
+            await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+        finally:
+            await runner.stop()
+    assert runner.session.completion_reason == "benefits_extracted"
+    write_failed_events = [
+        e
+        for e in captured
+        if e.get("event") == "benefits_record_write_failed" and e.get("log_level") == "error"
+    ]
+    assert len(write_failed_events) == 1, (
+        f"expected exactly one error-level benefits_record_write_failed event, "
+        f"got {len(write_failed_events)}; all events: {[e.get('event') for e in captured]}"
+    )
+
+
+async def test_jsonl_serialize_failure_logs_and_skips_write(
+    make_session: MakeSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """If `json.dumps(record)` raises (e.g. a future model gains a
+    non-serializable field like `datetime`), the serialize-first ordering
+    in `_append_benefits_record` must surface the failure as
+    `benefits_record_serialize_failed` at error level AND skip the file
+    write entirely — no torn JSONL row, no half-written line that breaks
+    every downstream reader.
+
+    Locks the contract for the new serialize-then-write split. A refactor
+    that moves serialization back inline with the write would silently
+    re-introduce torn writes and fail this test.
+    """
+    log_path = tmp_path / "benefits.jsonl"
+    monkeypatch.setenv("BENEFITS_LOG_PATH", str(log_path))
+
+    def _raising_dumps(*_args: object, **_kwargs: object) -> NoReturn:
+        raise TypeError("bad field")
+
+    monkeypatch.setattr("agent.call_session.json.dumps", _raising_dumps)
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+        )
+    ]
+    with structlog.testing.capture_logs() as captured:
+        try:
+            await runner.start()
+            runner.submit_transcript("Thank you, goodbye.")
+            await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+        finally:
+            await runner.stop()
+    assert runner.session.completion_reason == "benefits_extracted"
+    serialize_failed_events = [
+        e
+        for e in captured
+        if e.get("event") == "benefits_record_serialize_failed" and e.get("log_level") == "error"
+    ]
+    assert len(serialize_failed_events) == 1, (
+        f"expected exactly one error-level benefits_record_serialize_failed event, "
+        f"got {len(serialize_failed_events)}"
+    )
+    # The file must NOT exist — serialize-first ordering means we never
+    # opened the file at all on a serialize failure.
+    assert not log_path.exists(), (
+        "log file was created despite serialize failure; serialize-then-write ordering is broken"
+    )
 
 
 async def test_ivr_turn_dispatches_send_dtmf_intent(make_session: MakeSession):
@@ -134,7 +304,8 @@ async def test_ivr_turn_records_history(make_session: MakeSession):
 
 async def test_speak_intent_is_pushed_to_out_queue(make_session: MakeSession):
     """The default CallActuator routes SpeakIntent.text into out_queue —
-    that's the production wire to Cartesia via state_processor."""
+    that's the production wire to the configured TTS service via
+    state_processor's pump."""
     runner, ivr_llm, _rep = _build_runner(make_session())
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "hello there"})]),
@@ -459,35 +630,19 @@ async def test_each_queued_transcript_drives_its_own_turn(make_session: MakeSess
         await runner.stop()
 
 
-# --- DTMFIntent without a twilio client raises (CallActuator path) --------
+# --- DTMFIntent currently routes through speech (TEMP — see actuator.py) ---
 
 
-async def test_call_actuator_without_twilio_client_rejects_dtmf(make_session: MakeSession):
-    """The default CallActuator raises if asked to dispatch DTMF without a
-    Twilio client. Locks the precondition for live-call wiring."""
+async def test_call_actuator_dtmf_speaks_digits_via_out_queue(make_session: MakeSession):
+    """TEMP: until DTMF is rendered as audio tones over the Media Stream, the
+    actuator stands in by enqueueing a spoken-digit string. This test pins that
+    contract; when real DTMF lands it should be replaced with one asserting an
+    audio frame goes out."""
     session = make_session()
     out_queue: asyncio.Queue[str] = asyncio.Queue()
     actuator = CallActuator(session=session, out_queue=out_queue, twilio_client=None)
-    with pytest.raises(ActuatorError) as exc_info:
-        await actuator.execute(DTMFIntent(digits="1"))
-    assert exc_info.value.intent_kind == "dtmf"
-
-
-async def test_call_actuator_dispatches_dtmf_via_send_digits(make_session: MakeSession):
-    """Live-call DTMF path: actuator forwards `(twilio_client, call_sid, digits)`
-    to `send_digits`. Locks the call-arity boundary — a regression that swaps
-    args silently breaks IVR navigation in production calls."""
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    session = make_session()
-    out_queue: asyncio.Queue[str] = asyncio.Queue()
-    twilio_client = MagicMock()
-    actuator = CallActuator(session=session, out_queue=out_queue, twilio_client=twilio_client)
-
-    with patch("agent.actuator.send_digits", new_callable=AsyncMock) as send_mock:
-        await actuator.execute(DTMFIntent(digits="123"))
-
-    send_mock.assert_awaited_once_with(twilio_client, session.call_sid, "123")
+    await actuator.execute(DTMFIntent(digits="123"))
+    assert await out_queue.get() == "Pressing 123."
 
 
 async def test_call_actuator_hangup_is_noop(make_session: MakeSession):

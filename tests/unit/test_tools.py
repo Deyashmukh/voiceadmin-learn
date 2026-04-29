@@ -1,4 +1,4 @@
-"""Unit tests for M5'/B: IVR tools dispatcher + arg validation."""
+"""Unit tests for the IVR tools dispatcher + arg validation."""
 
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ async def test_dispatch_unknown_tool_name_raises_keyerror(make_session: MakeSess
     """Locks the contract: if the `ToolName` Literal invariant is bypassed
     (e.g., a dict-built ToolCall from a Langfuse replay or a future SDK that
     doesn't validate names), the dispatcher fails loudly rather than silently
-    no-oping. M5'/C is responsible for catching hallucinations at the client
-    boundary before they reach here."""
+    no-oping. The IVR LLM client is responsible for catching hallucinations
+    at the client boundary before they reach here."""
 
     class _ForgedToolCall:
         name = "made_up"

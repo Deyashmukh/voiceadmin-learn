@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import NamedTuple, Protocol, TypedDict, Unpack
 
 import pytest
@@ -20,6 +21,17 @@ from agent.schemas import (
     SideEffectIntent,
     Turn,
 )
+
+
+@pytest.fixture(autouse=True)
+def _redirect_benefits_log(  # pyright: ignore[reportUnusedFunction]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Send the per-call benefits JSONL to a tmp file for the duration of
+    each test, so unit tests don't pollute the repo root with `benefits.jsonl`
+    every time they run a complete call. Pytest discovers this by name; the
+    pyright ignore is for the `autouse` indirection."""
+    monkeypatch.setenv("BENEFITS_LOG_PATH", str(tmp_path / "benefits.jsonl"))
 
 
 class CallSessionOverrides(TypedDict, total=False):

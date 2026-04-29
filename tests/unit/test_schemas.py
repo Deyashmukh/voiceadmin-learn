@@ -1,4 +1,4 @@
-"""Unit tests for M5'/A schemas — Benefits relaxation, tool args, CallSession."""
+"""Unit tests for the schemas — Benefits, tool args, CallSession."""
 
 from __future__ import annotations
 
@@ -107,7 +107,7 @@ def test_record_benefit_args_preserves_bool_vs_float(
     value: bool | float | None, expected_type: type
 ):
     """Pydantic v2 smart mode used to coerce False↔0.0 silently. Lock the
-    distinction in — the dispatcher in M5'/B uses `value`'s type to validate
+    distinction in — the tool dispatcher uses `value`'s type to validate
     against the field's expected type (`bool` for active/oon, `float` for
     deductible/copay/coinsurance)."""
     args = RecordBenefitArgs(field="active", value=value)

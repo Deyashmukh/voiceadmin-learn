@@ -48,12 +48,12 @@ def smoke_deepgram() -> str:
     return f"OK — {len(projects.projects)} project(s)"
 
 
-def smoke_cartesia() -> str:
-    from cartesia import Cartesia
+def smoke_elevenlabs() -> str:
+    from elevenlabs.client import ElevenLabs
 
-    ct = Cartesia(api_key=os.environ["CARTESIA_API_KEY"])
-    voices = list(ct.voices.list())
-    return f"OK — {len(voices)} voice(s)"
+    el = ElevenLabs(api_key=os.environ["ELEVENLABS_API_KEY"])
+    voices = el.voices.get_all()
+    return f"OK — {len(voices.voices)} voice(s)"
 
 
 for name, fn in [
@@ -61,7 +61,7 @@ for name, fn in [
     ("groq/qwen3-32b", lambda: smoke_groq_model("qwen/qwen3-32b")),
     ("groq/llama-4-scout", lambda: smoke_groq_model("meta-llama/llama-4-scout-17b-16e-instruct")),
     ("deepgram", smoke_deepgram),
-    ("cartesia", smoke_cartesia),
+    ("elevenlabs", smoke_elevenlabs),
 ]:
     try:
         results[name] = fn()

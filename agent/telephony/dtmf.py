@@ -1,9 +1,15 @@
-"""Mid-stream DTMF injection over Twilio.
+"""SUPERSEDED — kept as an artifact for the real-DTMF wiring.
 
-Once a call is connected (Media Streams open), `<Play digits>` injected via a
-TwiML update on the live call sid sends DTMF tones to the remote side. The
-allowlist check in `dialer.py` doesn't apply here — the call already exists,
-so this isn't a new outbound dial.
+This module's `<Play digits>`-via-TwiML-update approach is NOT the active
+DTMF path. Live testing showed that posting a TwiML update to the active
+call sid replaces the running TwiML and ends the Media Stream — i.e., it
+hangs up the call. See `agent/actuator.py` for the current TEMP path
+(speak the digits via `out_queue`) and the planned real fix (generate
+DTMF dual-tone PCM and emit it as `OutputAudioRawFrame` over the WSS).
+
+`send_digits` is no longer called from `agent/`; only a unit test exercises
+it. The module stays in-tree as a reminder of the failed approach so a
+future implementer doesn't re-derive it.
 """
 
 from __future__ import annotations

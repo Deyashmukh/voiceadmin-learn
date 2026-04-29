@@ -1,4 +1,4 @@
-"""Property-based tests for `agent.tools.dispatch` (M8'/D).
+"""Property-based tests for `agent.tools.dispatch`.
 
 The dispatcher is the determinism boundary: every IVR LLM tool call passes
 through it, and validation failures must round-trip back to the LLM as
