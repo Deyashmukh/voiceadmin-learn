@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 import pytest
@@ -18,6 +19,7 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
     UserStartedSpeakingFrame,
     VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -54,8 +56,7 @@ class _SinkProcessor(FrameProcessor):
 async def _make_processor(
     make_session: Callable[..., CallSession],
     ivr_responses: list[IVRTurnResponse] | None = None,
-    ivr_debounce_s: float = 0.0,
-    rep_debounce_s: float = 0.0,
+    vad_stopped_grace_s: float = 0.0,
 ) -> tuple[StateMachineProcessor, CallSessionRunner, _SinkProcessor]:
     session = make_session()
     ivr_llm = FakeIVRLLMClient(responses=list(ivr_responses or []))
@@ -69,14 +70,14 @@ async def _make_processor(
         tools=[],
         actuator=FakeActuator(),
     )
-    # Default 0s debounce so transcripts flush immediately and assertions
-    # don't have to budget for the production wait. The dedicated debounce
-    # tests override to a small positive value.
+    # Default 0s grace so transcripts flush as soon as VAD says stopped (or
+    # immediately for late-arriving transcripts), without making tests pay
+    # the production wait. The dedicated grace test overrides to a small
+    # positive value.
     proc = StateMachineProcessor(
         runner,
         enable_direct_mode=True,
-        ivr_debounce_s=ivr_debounce_s,
-        rep_debounce_s=rep_debounce_s,
+        vad_stopped_grace_s=vad_stopped_grace_s,
     )
     sink = _SinkProcessor()
     proc.link(sink)
@@ -152,21 +153,51 @@ async def test_interim_transcription_is_not_enqueued(make_session: MakeSession):
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
 
-async def test_transcripts_are_debounced_into_one_submission(make_session: MakeSession):
-    """Three TranscriptionFrames within the debounce window should collapse to
-    one submission carrying the joined text. IVR menus arrive as multiple
-    finals; the debouncer prevents the agent from reacting to fragments.
+async def test_vad_driven_flush_aggregates_menu_into_one_submission(
+    make_session: MakeSession,
+):
+    """Multi-sentence menu: three transcripts arrive while VAD reports
+    speech is still active (caller still talking through the menu). When
+    VAD signals stopped, the processor flushes the buffer as a single
+    joined submission after the grace period.
 
-    No StartFrame here — we want to inspect what `submit_transcript` receives
+    No StartFrame — we want to inspect what `submit_transcript` receives
     without the consumer immediately draining `in_queue`.
     """
-    proc, runner, _ = await _make_processor(make_session, ivr_debounce_s=0.05)
+    proc, runner, _ = await _make_processor(make_session, vad_stopped_grace_s=0.05)
+    # Caller is mid-menu — speech_active set, no flush should fire on
+    # transcript arrival.
+    await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
     await proc.process_frame(_transcription("Press 1 for benefits."), FrameDirection.DOWNSTREAM)
     await proc.process_frame(_transcription("Press 2 for claims."), FrameDirection.DOWNSTREAM)
     await proc.process_frame(_transcription("Press 9 for a rep."), FrameDirection.DOWNSTREAM)
+    assert runner.in_queue.empty()
+    # Caller stops speaking — flush fires after the grace period.
+    await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
     await wait_until(lambda: not runner.in_queue.empty(), timeout=5.0)
     combined = runner.in_queue.get_nowait()
     assert combined == "Press 1 for benefits. Press 2 for claims. Press 9 for a rep."
+    assert runner.in_queue.empty()
+
+
+async def test_vad_restart_during_grace_cancels_pending_flush(make_session: MakeSession):
+    """Inter-option pause: VAD reports stopped, then re-started before the
+    grace period elapses. The pending flush must cancel — fragmenting a
+    menu into two turns is exactly the bug VAD-driven flushing prevents.
+    """
+    proc, runner, _ = await _make_processor(make_session, vad_stopped_grace_s=0.2)
+    await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(_transcription("Press 1 for benefits."), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    # Resume speaking before the 200ms grace expires.
+    await asyncio.sleep(0.05)
+    await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(_transcription("Press 9 for a rep."), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    # Now wait for the actual final flush.
+    await wait_until(lambda: not runner.in_queue.empty(), timeout=5.0)
+    combined = runner.in_queue.get_nowait()
+    assert combined == "Press 1 for benefits. Press 9 for a rep."
     assert runner.in_queue.empty()
 
 

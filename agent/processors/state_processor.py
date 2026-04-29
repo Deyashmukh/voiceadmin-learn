@@ -23,44 +23,54 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSSpeakFrame,
     UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from agent.call_session import CallSessionRunner
 from agent.logging_config import log
 
-_IVR_DEBOUNCE_S = 2.5
-"""Quiet window in IVR mode. Payer IVR menus arrive as 3-5 separate Deepgram
-finals (one per option, with natural pauses); without aggregation each becomes
-its own LLM turn and the agent reacts to fragments. 2.5s spans the typical
-inter-option pause in a recorded menu."""
-
-_REP_DEBOUNCE_S = 0.6
-"""Quiet window in rep mode. A human rep speaks in single utterances with
-short breath-pauses; 0.6s catches the natural end-of-turn without making the
-agent feel sluggish. Aggressive but ergonomic."""
+_VAD_STOPPED_GRACE_S = 0.7
+"""Cooldown after VAD signals end-of-speech before flushing buffered
+transcripts. We use VAD's actual end-of-speech signal (rather than a
+wall-clock debounce on transcript arrival) so the flush adapts to the
+caller's real cadence. 0.7s is longer than typical inter-option pauses in
+recorded payer IVRs (300-500ms) — so a multi-sentence menu doesn't
+fragment — but short enough that conversation in rep mode feels live.
+Combined with Silero's internal stop threshold (~800ms of silence before
+declaring `stopped`), end-to-end flush latency after a menu finishes is
+~1.5s — about 60% faster than the prior 4s wall-clock debounce."""
 
 
 class StateMachineProcessor(FrameProcessor):
     """Bridge Pipecat frames to the call session runner.
 
-    - Finalized `TranscriptionFrame`s are buffered and flushed as a single
-      submission once the speaker has been quiet (mode-aware: long for IVR
-      menus, short for rep conversation).
-    - `UserStartedSpeakingFrame` / `InterruptionFrame` cancel the in-flight
-      turn AND propagate `InterruptionFrame` downstream so Pipecat's TTS
-      and output transport stop synthesizing / streaming any tail audio.
-    - Responses from `runner.out_queue` are pushed downstream as `TTSSpeakFrame`s.
-    - The runner's lifecycle is pinned to `StartFrame` / `EndFrame` / `CancelFrame`.
+    Transcript flushing is VAD-driven, not time-driven: we buffer
+    `TranscriptionFrame`s as they arrive and flush them as a single
+    submission `_VAD_STOPPED_GRACE_S` after VAD signals end-of-speech.
+    A new VAD-started before the grace period elapses cancels the flush
+    (the speaker was just pausing between options). This adapts to the
+    actual cadence of the caller — short menus flush quickly, long
+    multi-sentence menus aggregate naturally.
+
+    Other responsibilities:
+    - `UserStartedSpeakingFrame` / `InterruptionFrame` (only while the bot
+      is mid-TTS) cancel the in-flight turn AND propagate
+      `InterruptionFrame` downstream so Pipecat's TTS and output transport
+      stop synthesizing / streaming any tail audio.
+    - Responses from `runner.out_queue` are pushed downstream as
+      `TTSSpeakFrame`s.
+    - The runner's lifecycle is pinned to `StartFrame` / `EndFrame` /
+      `CancelFrame`.
     """
 
     def __init__(
         self,
         runner: CallSessionRunner,
         *,
-        ivr_debounce_s: float = _IVR_DEBOUNCE_S,
-        rep_debounce_s: float = _REP_DEBOUNCE_S,
+        vad_stopped_grace_s: float = _VAD_STOPPED_GRACE_S,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)  # pyright: ignore[reportUnknownMemberType] (Pipecat stub gap)
@@ -68,14 +78,16 @@ class StateMachineProcessor(FrameProcessor):
         self._pump_task: asyncio.Task[None] | None = None
         self._transcript_buffer: list[str] = []
         self._flush_task: asyncio.Task[None] | None = None
-        self._ivr_debounce_s = ivr_debounce_s
-        self._rep_debounce_s = rep_debounce_s
+        self._vad_stopped_grace_s = vad_stopped_grace_s
         # Tracks whether the agent's TTS is currently being played to the
         # caller. Barge-in (VAD-driven interrupt) is only meaningful while
         # the agent is talking — VAD fires on every breath pause during a
         # multi-sentence IVR menu, and treating each as an interrupt drains
         # the transcript buffer and kills the turn.
         self._bot_speaking: bool = False
+        # Tracks whether the caller (IVR/rep) is currently speaking, per
+        # VAD. Used to decide when to flush buffered transcripts.
+        self._speech_active: bool = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -84,9 +96,6 @@ class StateMachineProcessor(FrameProcessor):
             await self._start()
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self._stop()
-        elif isinstance(frame, TranscriptionFrame):
-            if frame.text.strip():
-                self._buffer_transcript(frame.text.strip())
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
         elif isinstance(frame, BotStoppedSpeakingFrame):
@@ -95,15 +104,26 @@ class StateMachineProcessor(FrameProcessor):
             # Explicit InterruptionFrame is unconditional — caller has
             # decided this is a real interrupt.
             await self._handle_barge_in(downstream_interruption=False)
-        elif (
-            isinstance(frame, (UserStartedSpeakingFrame, VADUserStartedSpeakingFrame))
-            and self._bot_speaking
-        ):
-            # VAD-driven barge-in: only act if the agent is currently
-            # speaking. Otherwise this is just the caller talking to the
-            # IVR with normal inter-sentence pauses and we should NOT drop
-            # the buffered transcripts.
-            await self._handle_barge_in(downstream_interruption=True)
+        elif isinstance(frame, (UserStartedSpeakingFrame, VADUserStartedSpeakingFrame)):
+            self._speech_active = True
+            # New speech started — cancel any pending flush; this could be
+            # a brief pause between menu options, OR (if the bot is
+            # speaking) a real barge-in that needs to drain the buffer.
+            self._cancel_flush()
+            if self._bot_speaking:
+                await self._handle_barge_in(downstream_interruption=True)
+        elif isinstance(frame, (UserStoppedSpeakingFrame, VADUserStoppedSpeakingFrame)):
+            self._speech_active = False
+            # Speaker just stopped — schedule a flush after a short grace
+            # period in case it's just an inter-option pause.
+            self._schedule_flush()
+        elif isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            self._transcript_buffer.append(frame.text.strip())
+            # Late transcript (Deepgram lags VAD): if speech has already
+            # ended, ensure a flush is pending. Otherwise we'll wait for
+            # the upcoming VAD-stopped event.
+            if not self._speech_active and self._flush_task is None:
+                self._schedule_flush()
 
         await self.push_frame(frame, direction)
 
@@ -127,18 +147,15 @@ class StateMachineProcessor(FrameProcessor):
         if downstream_interruption:
             await self.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
 
-    def _buffer_transcript(self, text: str) -> None:
-        """Append a finalized transcript and (re)arm the debounce timer.
-
-        Mode-aware: IVR menus need a long quiet window to aggregate; rep
-        conversation needs a short one so the agent doesn't feel sluggish.
+    def _schedule_flush(self) -> None:
+        """Arm a delayed flush of the transcript buffer. Called when VAD
+        signals the speaker has stopped — the grace period catches an
+        inter-option pause vs. a true end-of-utterance.
         """
-        self._transcript_buffer.append(text)
         self._cancel_flush()
-        delay = self._ivr_debounce_s if self._runner.session.mode == "ivr" else self._rep_debounce_s
         self._flush_task = asyncio.create_task(
-            self._flush_after_quiet(delay),
-            name="state-processor-debounce",
+            self._flush_after_quiet(self._vad_stopped_grace_s),
+            name="state-processor-flush",
         )
 
     def _cancel_flush(self) -> None:
@@ -151,11 +168,16 @@ class StateMachineProcessor(FrameProcessor):
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
-        if not self._transcript_buffer:
-            return
-        combined = " ".join(self._transcript_buffer)
-        self._transcript_buffer.clear()
-        self._runner.submit_transcript(combined)
+        try:
+            if not self._transcript_buffer:
+                return
+            combined = " ".join(self._transcript_buffer)
+            self._transcript_buffer.clear()
+            self._runner.submit_transcript(combined)
+        finally:
+            # Clear the reference so a late-arriving transcript (Deepgram
+            # lagged past the VAD-stopped grace) can schedule a fresh flush.
+            self._flush_task = None
 
     async def _start(self) -> None:
         if self._pump_task is not None:

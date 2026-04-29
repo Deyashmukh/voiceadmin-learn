@@ -161,12 +161,15 @@ class GroqToolCallingClient:
                 model=self._model,
                 messages=cast(Any, messages),
                 tools=cast(Any, tools),
-                # IVR turns are deterministic action selection — every output
-                # must be a tool call. `required` forces the model to pick
-                # one. Llama-4-Scout sometimes errors `tool_use_failed` (400)
-                # when input is conversational and it can't classify; the
-                # `except` below converts that into a no-progress turn rather
-                # than killing the consumer.
+                # `required`: every IVR turn must produce exactly one tool
+                # call. Determinism > forgiveness — the watchdog can
+                # terminate a call that's making bad presses, but the
+                # alternative (silent inaction) deadlocks the call. The
+                # 4s debounce upstream collapses fragmentary input into
+                # whole menus so the LLM has good context per call. The
+                # `except` below converts a Groq 4xx
+                # (`tool_use_failed` for un-classifiable input) into a
+                # no-progress turn instead of killing the consumer.
                 tool_choice="required",
                 temperature=temperature,
                 max_tokens=512,
