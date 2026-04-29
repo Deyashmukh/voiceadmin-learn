@@ -29,6 +29,7 @@ from agent.schemas import (
     CompleteCallReason,
     HangupIntent,
     ToolCall,
+    Turn,
 )
 
 from .conftest import MakeSession
@@ -269,8 +270,12 @@ def test_transfer_to_rep_idempotent(
     assert first_index is not None
 
     for _ in range(call_count - 1):
+        # Mutate `history` between calls so a buggy implementation that
+        # re-set `rep_mode_index = len(history)` unconditionally would now
+        # produce a DIFFERENT index than `first_index` — exercising the
+        # `is None` gate the dispatcher uses, not just the first-call shape.
+        session.history.append(Turn(role="user", content="ack"))
         result = asyncio.run(tools.dispatch(ToolCall(name="transfer_to_rep", args={}), session))
         assert result.success
         assert session.mode == "rep"
-        # `rep_mode_index` is frozen at the first flip's value.
         assert session.rep_mode_index == first_index
