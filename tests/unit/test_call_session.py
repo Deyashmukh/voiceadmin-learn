@@ -3,7 +3,6 @@
 default CallActuator (with no twilio_client) routes SpeakIntent into
 out_queue natively, so tests can read spoken text from there directly."""
 
-# pyright: reportPrivateUsage=false
 from __future__ import annotations
 
 import asyncio
@@ -251,10 +250,10 @@ async def test_mark_interrupted_cancels_in_flight_turn(make_session: MakeSession
         await runner.start()
         runner.submit_transcript("kickoff")
         await wait_until(
-            lambda: runner._current_turn is not None and not runner._current_turn.done()
+            lambda: runner._current_turn is not None and not runner._current_turn.done()  # pyright: ignore[reportPrivateUsage]
         )
         runner.mark_interrupted()
-        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())
+        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())  # pyright: ignore[reportPrivateUsage]
         # Turn was cancelled → no actuator call happened, no completion set.
         assert runner.session.completion_reason is None
     finally:
@@ -276,7 +275,7 @@ async def test_mark_interrupted_does_not_complete_call(make_session: MakeSession
         await runner.start()
         runner.submit_transcript("first")
         await wait_until(
-            lambda: runner._current_turn is not None and not runner._current_turn.done()
+            lambda: runner._current_turn is not None and not runner._current_turn.done()  # pyright: ignore[reportPrivateUsage]
         )
         runner.mark_interrupted()
         ivr_llm.slow_mode_seconds = 0.0
@@ -313,10 +312,10 @@ async def test_cancellation_mid_tool_dispatch_pairs_history(make_session: MakeSe
         await runner.start()
         runner.submit_transcript("kickoff")
         await wait_until(
-            lambda: runner._current_turn is not None and not runner._current_turn.done()
+            lambda: runner._current_turn is not None and not runner._current_turn.done()  # pyright: ignore[reportPrivateUsage]
         )
         runner.mark_interrupted()
-        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())
+        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())  # pyright: ignore[reportPrivateUsage]
         # History must end with a tool_result paired to the tool_call.
         roles = [t.role for t in session.history]
         # user → tool_call → tool_result(cancelled)
@@ -361,7 +360,7 @@ async def test_consumer_exits_after_complete_call_without_extra_transcript(
     runner.submit_transcript("Done with menu")
     # Wait for both: session.done AND consumer task itself completes.
     await wait_until(lambda: runner.session.done)
-    await wait_until(lambda: runner._consumer is not None and runner._consumer.done())
+    await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
     assert runner.session.completion_reason == "benefits_extracted"
     # Consumer is done — stop() should be a no-op for the consumer task.
     await runner.stop()
@@ -390,7 +389,7 @@ async def test_consumer_death_sets_completion_reason(make_session: MakeSession):
     try:
         await runner.start()
         runner.submit_transcript("kickoff")
-        await wait_until(lambda: runner._consumer is not None and runner._consumer.done())
+        await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
         assert runner.session.completion_reason == "consumer_died"
     finally:
         await runner.stop()
@@ -755,10 +754,10 @@ async def test_rep_turn_cancellation_propagates_cleanly(make_session: MakeSessio
         await runner.start()
         runner.submit_transcript("Hi, this is Sam.")
         await wait_until(
-            lambda: runner._current_turn is not None and not runner._current_turn.done()
+            lambda: runner._current_turn is not None and not runner._current_turn.done()  # pyright: ignore[reportPrivateUsage]
         )
         runner.mark_interrupted()
-        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())
+        await wait_until(lambda: runner._current_turn is not None and runner._current_turn.done())  # pyright: ignore[reportPrivateUsage]
         # Cancelled before the LLM returned → no merge, no assistant Turn, no
         # phase advancement, no completion.
         assert runner.session.benefits.active is None
