@@ -2,7 +2,7 @@
 
 ## Context
 
-After a deep-dive on Revenue Cycle Management (RCM) and how production voice agents like VoiceAdmin work, the goal is to build a **working voice agent end-to-end** — not for production, but to internalize how these systems are actually architected. Specifically: how an LLM-with-tools layer drives deterministic side effects (DTMF, TTS, structured extraction), how **VAD + barge-in** creates the illusion of natural conversation, and how this stack touches real telephony.
+After a deep-dive on Revenue Cycle Management (RCM) and how production voice agents like VoiceAdmin work, the goal is to build a **working voice agent end-to-end** — not deployed to real users, but built at production-grade dev quality so that the code, tests, and process would pass a senior production-readiness review. The project teaches both how these systems are architected (LLM-with-tools, deterministic side effects, VAD + barge-in, real telephony) AND the discipline (typing, tests, CI, error handling, observability) of shipping code that wouldn't embarrass a staff engineer. Deployment-grade infrastructure (IaC, secrets, alerting, multi-region, persistence) stays out of scope; dev-quality bar does not.
 
 The target workflow is **Eligibility & Benefits Verification** — the canonical RCM voice task. The agent calls a "payer," authenticates with provider info, navigates an IVR menu, transitions to a human rep when handed off, holds a natural conversation to extract benefits, and ends the call cleanly with structured JSON: `{active, deductible_remaining, copay, coinsurance, out_of_network_coverage}`.
 
@@ -283,6 +283,19 @@ If a hold *announcement* gets transcribed (e.g., *"please continue to hold"*), i
 
 16. **M7'+ — Rep deviations (optional, only if M7' clean).** User adds three rep deviations across runs: small talk (weather), ambiguous answer (rep hedges), emotional content (rep mentions difficult day). Verify rep LLM handles each via persona prompting alone — no template logic, no banned-phrase lint.
 
+17. **M8' — Production-grade dev quality.** Lift the codebase from "learning project" rigor to "would pass a senior production-readiness review." Each sub-task is its own PR. **M8'/A and M8'/B should land before M6'/M7' live testing** — pyright strict will surface latent bugs in the same modules live tests exercise, and CI gating prevents regressions during the live phase. M8'/C–I can run in parallel with M6'/M7'.
+
+    - **M8'/A — Pyright strict.** Switch `[tool.pyright]` to strict per-file with `# pyright: strict` headers. Use `# type: ignore[X]` only for genuine Pipecat type-stub gaps. Latent bugs (untyped optional access, missing return types, partial unknown SDK types) get fixed individually, not blanket-ignored.
+    - **M8'/B — GitHub Actions CI.** Single workflow that runs `uv sync`, `ruff check`, `ruff format --check`, `pyright`, `pytest tests/unit` on every PR. Required check on `main`. Also: extend `[tool.ruff.lint] select` to include at minimum `SIM` (flake8-simplify) and `RUF` (ruff-specific) on top of the current `E,F,I,B,UP,N,W` — the broader rule set is what production-grade lint coverage looks like.
+    - **M8'/C — Coverage thresholds.** Add `pytest-cov` dev dep. Run once to measure baseline, then set per-module thresholds in CI calibrated against that baseline (initial targets ≥90% on `agent/call_session.py`, ≥85% on `agent/tools.py`; calibrate the rest). Don't pin numbers ahead of measurement.
+    - **M8'/D — Hypothesis dispatcher tests.** Add `hypothesis` dev dep. Property-based tests on `agent/tools.py:dispatch` covering: DTMF digit allowlist × menu options × universal keys; `record_benefit` field-type matrix (bool/float ↔ each `BenefitField`); arg-validator rejection paths. The combinatorial space is exactly Hypothesis's strength.
+    - **M8'/E1 — Error taxonomy: define + new raise sites.** Add `agent/errors.py` with `AgentError` base + specific subclasses (`LLMRefusalError`, `DestinationNotAllowedError`, `ToolDispatchError`, `ActuatorError`). Use the new types at fresh raise sites; no migration in this PR.
+    - **M8'/E2 — Error taxonomy: migrate.** Replace existing `RuntimeError("...")` raises across `llm_client.py` (3 sites), `actuator.py` (2 sites), `telephony/dialer.py` (1 site). Update test `pytest.raises(RuntimeError, match="...")` strings (~4 sites in `test_llm_client.py` and `test_call_session.py`) to type-based matching. Independent from E1; lands separately so the diff stays reviewable.
+    - **M8'/F — Barge-in latency regression test.** Two-step: (i) measure current cancel-to-silence latency under `@observe` decorators and report the number — this is the actual baseline (the historical `<150ms` was an M2 manual observation, never asserted in tests); (ii) add a CI-running test asserting latency stays under whatever the measured baseline + reasonable headroom is. If step (i) shows we're already past a sensible budget, fix the overhead before pinning the test.
+    - **M8'/G — `pip-audit` in CI.** Catches CVE'd transitive deps. Fail CI on high-severity advisories; warn on others.
+    - **M8'/H — Determinism in async tests.** Replace `time.monotonic()` polling in `_wait_until` (`test_call_session.py`, `test_state_processor.py`) with deterministic event-loop control or fake clocks. The M3-era timing flakes — `log.exception` blocking the event loop ~1.5s under unconfigured structlog, exceeding the 1.0s `asyncio.wait_for` budget in 3 tests — were exactly this class of bug.
+    - **M8'/I — Secret scanning.** `gitleaks` (or `trufflehog`) in CI as a pre-merge gate. The repo touches Twilio + Anthropic + Deepgram + Cartesia + Groq + Langfuse credentials — `.env.example` discipline catches one class of leak; pre-merge scanning catches the rest. Higher priority than M8'/G given the actual threat model.
+
 ## Key files (post-pivot)
 
 ```
@@ -327,13 +340,23 @@ voiceadmin-learn/
 - **M5'/A:** `pytest tests/unit/test_schemas.py` passes; new types instantiate; tool-arg validators reject malformed input.
 - **M5'/B:** `pytest tests/unit/test_tools.py` passes; every validator hit on happy + invalid path; dispatcher returns tool-error messages on rejection.
 - **M5'/C:** Anthropic Haiku 4.5 client reaches a real Anthropic endpoint in a manual REPL check; `messages.parse(output_format=RepTurnOutput)` returns a validated instance. Cancellation propagation through the SDK await verified offline. Prompt-cache assertion (`cache_creation_input_tokens > 0` / `cache_read_input_tokens > 0`) deferred until the persona prompt grows past Haiku's 4096-token minimum cacheable prefix — current persona is shorter, so the marker is set but caching is a no-op (silently, no error). Re-enable the assertion in M7' if the persona crosses that boundary.
-- **M5'/D:** `pytest tests/unit/test_call_session.py` passes; cancellation test (slow-LLM barge-in) cancels within 150ms; `out_queue` is drained on `mark_interrupted` (regression for the M4 post-review fix); watchdogs trigger on no-progress and stuck cases.
-- **M5'/E:** `pyproject.toml` no longer mentions `langgraph` or `langchain`. `agent/graph*.py` and `agent/classifier.py` deleted. `agent/main.py` constructs `CallSession`, not `GraphRunner`. Full unit suite green. (`mock_payer/` was retained at first then deleted in a follow-up cleanup PR — it survives in git history as a learning artifact.)
+- **M5'/D:** `pytest tests/unit/test_call_session.py` passes; cancellation test (slow-LLM barge-in) cancels cleanly (current_turn task done, no leaks); `out_queue` is drained on `mark_interrupted` (regression for the M4 post-review fix); watchdogs trigger on no-progress and stuck cases. (Numeric cancel-to-silence latency was an M2 manual observation, not yet enforced — see M8'/F.)
+- **M5'/E:** `pyproject.toml` no longer mentions `langgraph` or `langchain`. `agent/graph*.py` and `agent/classifier.py` deleted. `agent/main.py` constructs `CallSession`, not `GraphRunner`. Full unit suite green. (`mock_payer/` was deleted in the follow-up cleanup; pre-pivot artifacts live in git history.)
 - **M5'/F:** Langfuse UI shows trace tree with one session per call; spans nest correctly (per-turn → LLM-call → tool-dispatch), not just spans existing in isolation.
-- **M6':** DTMF tones audible on user's cell during a live Media Streams call. Logged in `NOTES.md`.
+- **M6':** DTMF tones audible on user's cell during a live Media Streams call. Logged in commit message of the M6' branch.
 - **M7':** 5/5 happy-path runs land complete `Benefits`. Per-call total token budget under ~30k (sum across IVR + rep LLMs). Each run has a Langfuse trace.
 - **M7'+:** Each deviation passes 5/5 runs. Logs show the rep LLM's reasoning fields explaining the chosen behavior.
-- **Overall success metric:** 5 consecutive successful end-to-end runs with no manual intervention beyond playing the IVR + rep roles.
+- **M8'/A:** `[tool.pyright]` set to strict; every file in `agent/` carries `# pyright: strict`; CI-level pyright run is clean. Latent bugs surfaced during the strict-flip are fixed individually.
+- **M8'/B:** `.github/workflows/ci.yml` runs `ruff check`, `ruff format --check`, `pyright`, `pytest tests/unit` on every PR; required check on `main`. `pyproject.toml`'s `[tool.ruff.lint] select` extended with `SIM` and `RUF`.
+- **M8'/C:** `pytest --cov` enforced in CI with per-module thresholds calibrated against the first measurement. Failing coverage blocks merge.
+- **M8'/D:** Hypothesis property tests on `agent/tools.py:dispatch` cover: DTMF allowlist matrix, `record_benefit` field-type matrix, validator rejection paths. Tests run in CI.
+- **M8'/E1:** `agent/errors.py` exists with `AgentError` + four subclasses; new raise sites in M8'+ work use them.
+- **M8'/E2:** No `RuntimeError("...")` raises remain in `agent/`; every error is a typed `AgentError` subclass; tests match by type.
+- **M8'/F:** `tests/unit/test_barge_in_latency.py` exists, measures cancel-to-silence, asserts a budget, and runs in CI. The asserted budget is the measured baseline + headroom (NOT a copy-pasted `<150ms`).
+- **M8'/G:** `pip-audit` in CI; high-severity advisories fail the build.
+- **M8'/H:** Async timing tests use a deterministic clock; no test relies on `time.monotonic()` polling.
+- **M8'/I:** `gitleaks` (or equivalent) runs in CI as a required check; documented secret-rotation playbook in `docs/`.
+- **Overall success metric:** 5 consecutive successful end-to-end runs with no manual intervention beyond playing the IVR + rep roles, AND every M8' sub-task green in CI.
 
 ## Decisions made during planning (with pivot history)
 
