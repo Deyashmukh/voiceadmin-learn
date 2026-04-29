@@ -6,7 +6,10 @@ out_queue natively, so tests can read spoken text from there directly."""
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NoReturn
 
 import structlog.contextvars
@@ -79,6 +82,35 @@ async def test_submit_transcript_drops_oldest_when_full(make_session: MakeSessio
 
 
 # --- IVR turn happy path ----------------------------------------------------
+
+
+async def test_call_completion_appends_jsonl_record(make_session: MakeSession):
+    """One JSONL line per completed call — regardless of mode. Captures the
+    call_sid, completion_reason, patient identifiers, and final benefits.
+    `BENEFITS_LOG_PATH` is redirected to a tmp file by the autouse fixture
+    in conftest, so this assertion reads back exactly what the runner just
+    wrote."""
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+        )
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("Thank you, goodbye.")
+        await wait_until(lambda: runner.session.done)
+    finally:
+        await runner.stop()
+    log_path = Path(os.environ["BENEFITS_LOG_PATH"])
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["call_sid"] == runner.session.call_sid
+    assert record["completion_reason"] == "benefits_extracted"
+    assert record["patient"]["member_id"] == runner.session.patient.member_id
+    assert "benefits" in record
+    assert "completed_at" in record
 
 
 async def test_ivr_turn_dispatches_send_dtmf_intent(make_session: MakeSession):

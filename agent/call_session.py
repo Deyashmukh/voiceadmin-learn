@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
+import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, Protocol
 
 import structlog
@@ -36,6 +40,38 @@ from agent.schemas import (
 )
 
 QUEUE_MAX = 8
+
+_DEFAULT_BENEFITS_LOG_PATH = "benefits.jsonl"
+"""Default location for the per-call benefits JSONL. Overridable via the
+`BENEFITS_LOG_PATH` env var (read on each call so tests can redirect to a
+tmp file). Path is gitignored at the default location."""
+
+
+def _append_benefits_record(session: CallSession) -> None:
+    """Write one JSONL entry for this completed call: call_sid,
+    completion_reason, patient identifiers, extracted benefits, UTC
+    timestamp. JSONL (vs. a single JSON array) because append is a single
+    write — no read-modify-write race when multiple calls finish close
+    together. Failures are logged but never raised — logging is
+    best-effort and must not affect call teardown.
+    """
+    path = Path(os.environ.get("BENEFITS_LOG_PATH", _DEFAULT_BENEFITS_LOG_PATH))
+    record = {
+        "call_sid": session.call_sid,
+        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "completion_reason": session.completion_reason,
+        "patient": session.patient.model_dump(),
+        "benefits": session.benefits.model_dump(),
+        "turn_count": session.turn_count,
+        "mode_at_completion": session.mode,
+    }
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        log.warning("benefits_log_write_failed", path=str(path), error=str(exc))
+
+
 # After 2 IVR turns where no tool advanced call state, terminate. Distinct
 # from `llm_aborted_ivr` (LLM-deliberate) — this is the "the LLM is spinning
 # on validator rejections or producing no tool calls at all" case.
@@ -190,7 +226,12 @@ class CallSessionRunner:
             # consumer would block forever waiting for a transcript that
             # never comes.
             if self.session.done:
-                log.info("call_session_complete", reason=self.session.completion_reason)
+                log.info(
+                    "call_session_complete",
+                    reason=self.session.completion_reason,
+                    benefits=self.session.benefits.model_dump(),
+                )
+                _append_benefits_record(self.session)
                 return
 
     @observe(name="call_turn")
@@ -278,7 +319,11 @@ class CallSessionRunner:
         )
         if output.phase == "complete":
             self.session.completion_reason = "rep_complete"
-            log.info("rep_complete", reasoning=output.reasoning)
+            log.info(
+                "rep_complete",
+                reasoning=output.reasoning,
+                benefits=self.session.benefits.model_dump(),
+            )
         elif output.phase == "stuck":
             self.session.stuck_turns += 1
             if self.session.stuck_turns >= REP_STUCK_LIMIT:
