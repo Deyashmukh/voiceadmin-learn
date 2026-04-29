@@ -38,7 +38,7 @@ At the end of every milestone (or sub-task), run the `superpowers:simplify` skil
 
 After simplify, run the `superpowers:verification-before-completion` skill. No milestone is complete — and no commit is made — until verification has produced evidence.
 
-- Evidence means test output, lint output, type-check output, and any quantitative checks the plan specifies (e.g., M2's cancel-to-silence < 150ms assertion, M4's slow-LLM barge-in test).
+- Evidence means test output, lint output, type-check output, and any quantitative checks the plan specifies (e.g., barge-in latency budget once M8'/F lands, slow-LLM barge-in cancellation test).
 - "I think it works" and "the code looks right" are not verification.
 - If verification fails, fix the underlying issue. Do not bypass, stub out, or comment out failing checks.
 
