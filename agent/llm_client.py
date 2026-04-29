@@ -14,6 +14,7 @@ from anthropic.types import MessageParam
 from groq import AsyncGroq
 from pydantic import BaseModel, ValidationError
 
+from agent.errors import ConfigurationError, LLMRefusalError, LLMStopReason
 from agent.logging_config import log
 from agent.observability import enrich_current_generation, observe
 from agent.schemas import IVRTurnResponse, ToolCall, ToolName, Turn
@@ -51,7 +52,7 @@ class AnthropicRepClient:
             return
         key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not key:
-            raise RuntimeError("ANTHROPIC_API_KEY is not set")
+            raise ConfigurationError("ANTHROPIC_API_KEY is not set", setting="ANTHROPIC_API_KEY")
         self._client = AsyncAnthropic(api_key=key)
 
     @observe(as_type="generation", name="anthropic.complete_structured")
@@ -81,12 +82,15 @@ class AnthropicRepClient:
         parsed = response.parsed_output
         if parsed is None:
             # Refusal or schema mismatch — surface explicitly so callers can fall back.
-            # Include the response id for Langfuse / dashboard correlation.
-            stop = getattr(response, "stop_reason", "unknown")
+            # `stop_reason` and `response_id` go on the typed error so the
+            # caller can correlate without parsing the message.
+            stop: LLMStopReason = getattr(response, "stop_reason", "unknown")
             request_id = getattr(response, "id", "unknown")
-            raise RuntimeError(
+            raise LLMRefusalError(
                 f"Anthropic messages.parse() returned no parsed_output "
-                f"(stop_reason={stop}, response_id={request_id})"
+                f"(stop_reason={stop}, response_id={request_id})",
+                stop_reason=stop,
+                response_id=request_id,
             )
         return parsed
 
@@ -130,7 +134,7 @@ class GroqToolCallingClient:
             return
         key = api_key or os.environ.get("GROQ_API_KEY")
         if not key:
-            raise RuntimeError("GROQ_API_KEY is not set")
+            raise ConfigurationError("GROQ_API_KEY is not set", setting="GROQ_API_KEY")
         self._client = AsyncGroq(api_key=key)
         self._model = model
 

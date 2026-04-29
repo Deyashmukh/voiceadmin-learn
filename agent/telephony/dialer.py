@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass
 from typing import Protocol
 
+from agent.errors import ConfigurationError
+
 # Re-exported so `from agent.telephony.dialer import DestinationNotAllowedError`
 # continues to resolve; the canonical definition lives in `agent.errors`.
 from agent.errors import DestinationNotAllowedError as DestinationNotAllowedError
@@ -76,7 +78,9 @@ def dial(
     check_destination(to, effective_allowlist)
 
     if twilio_client is None:
-        raise RuntimeError("twilio_client must be provided to dial()")
+        raise ConfigurationError(
+            "twilio_client must be provided to dial()", setting="twilio_client"
+        )
 
     call = twilio_client.calls.create(to=to, from_=from_, url=url)
     return DialResult(call_sid=call.sid, to=to)

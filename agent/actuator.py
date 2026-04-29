@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Protocol, assert_never
 
+from agent.errors import ActuatorError
 from agent.schemas import (
     CallSession,
     DTMFIntent,
@@ -62,9 +63,10 @@ class CallActuator:
                 await self.out_queue.put(intent.text)
             case DTMFIntent():
                 if self.twilio_client is None:
-                    raise RuntimeError(
+                    raise ActuatorError(
                         "DTMFIntent emitted but actuator has no twilio_client; "
-                        "wire one in via CallSessionRunner construction."
+                        "wire one in via CallSessionRunner construction.",
+                        intent_kind="dtmf",
                     )
                 await send_digits(self.twilio_client, self.session.call_sid, intent.digits)
             case HangupIntent():
