@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import time
 from collections.abc import Callable
 
 import pytest
@@ -24,14 +22,20 @@ from agent.call_session import CallSessionRunner
 from agent.processors.state_processor import StateMachineProcessor
 from agent.schemas import CallSession, IVRTurnResponse, ToolCall
 
-from .conftest import FakeActuator, FakeAnthropicRepClient, FakeIVRLLMClient
+from .conftest import (
+    FakeActuator,
+    FakeAnthropicRepClient,
+    FakeIVRLLMClient,
+    MakeSession,
+    wait_until,
+)
 
 
 class _SinkProcessor(FrameProcessor):
     # Direct mode skips Pipecat's task setup so tests don't need a TaskManager.
 
     def __init__(self) -> None:
-        super().__init__(enable_direct_mode=True)
+        super().__init__(enable_direct_mode=True)  # pyright: ignore[reportUnknownMemberType] (Pipecat stub gap)
         self.received: list[Frame] = []
 
     async def queue_frame(
@@ -65,15 +69,6 @@ async def _make_processor(
     return proc, runner, sink
 
 
-async def _wait_until(predicate, timeout: float = 1.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"timed out waiting on {predicate.__name__}")
-
-
 def _finalized(text: str) -> TranscriptionFrame:
     """TranscriptionFrame in the shape Pipecat emits at end-of-utterance."""
     frame = TranscriptionFrame(text=text, user_id="user", timestamp="t")
@@ -84,35 +79,35 @@ def _finalized(text: str) -> TranscriptionFrame:
 # --- Lifecycle ----------------------------------------------------------------
 
 
-async def test_start_frame_starts_runner_and_pump(make_session):
+async def test_start_frame_starts_runner_and_pump(make_session: MakeSession):
     proc, runner, _ = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
-        assert runner._consumer is not None and not runner._consumer.done()
-        assert proc._pump_task is not None and not proc._pump_task.done()
+        assert runner._consumer is not None and not runner._consumer.done()  # pyright: ignore[reportPrivateUsage]
+        assert proc._pump_task is not None and not proc._pump_task.done()  # pyright: ignore[reportPrivateUsage]
     finally:
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
 
-async def test_end_frame_stops_runner_and_pump(make_session):
+async def test_end_frame_stops_runner_and_pump(make_session: MakeSession):
     proc, runner, _ = await _make_processor(make_session)
     await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
     await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
-    assert runner._consumer is None or runner._consumer.done()
-    assert proc._pump_task is None
+    assert runner._consumer is None or runner._consumer.done()  # pyright: ignore[reportPrivateUsage]
+    assert proc._pump_task is None  # pyright: ignore[reportPrivateUsage]
 
 
-async def test_cancel_frame_stops_runner(make_session):
+async def test_cancel_frame_stops_runner(make_session: MakeSession):
     proc, runner, _ = await _make_processor(make_session)
     await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
     await proc.process_frame(CancelFrame(), FrameDirection.DOWNSTREAM)
-    assert runner._consumer is None or runner._consumer.done()
+    assert runner._consumer is None or runner._consumer.done()  # pyright: ignore[reportPrivateUsage]
 
 
 # --- Frame routing ------------------------------------------------------------
 
 
-async def test_finalized_transcription_enqueues_to_runner(make_session):
+async def test_finalized_transcription_enqueues_to_runner(make_session: MakeSession):
     ivr_llm_responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})])
     ]
@@ -123,12 +118,12 @@ async def test_finalized_transcription_enqueues_to_runner(make_session):
         # The consumer pulls the transcript and runs a turn; queued response
         # ends the call. If routing or enqueue is broken the call never
         # terminates and the wait times out.
-        await _wait_until(lambda: runner.session.done)
+        await wait_until(lambda: runner.session.done)
     finally:
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
 
-async def test_non_finalized_transcription_is_ignored(make_session):
+async def test_non_finalized_transcription_is_ignored(make_session: MakeSession):
     proc, runner, _ = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
@@ -140,7 +135,7 @@ async def test_non_finalized_transcription_is_ignored(make_session):
         await proc.process_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
 
-async def test_empty_finalized_transcription_is_ignored(make_session):
+async def test_empty_finalized_transcription_is_ignored(make_session: MakeSession):
     proc, runner, _ = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
@@ -151,7 +146,7 @@ async def test_empty_finalized_transcription_is_ignored(make_session):
 
 
 @pytest.mark.parametrize("interrupt_frame", [UserStartedSpeakingFrame(), InterruptionFrame()])
-async def test_interrupt_frames_mark_interrupted(make_session, interrupt_frame):
+async def test_interrupt_frames_mark_interrupted(make_session: MakeSession, interrupt_frame: Frame):
     proc, runner, _ = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
@@ -165,12 +160,12 @@ async def test_interrupt_frames_mark_interrupted(make_session, interrupt_frame):
 # --- Output pump -------------------------------------------------------------
 
 
-async def test_pump_pushes_out_queue_text_downstream_as_textframe(make_session):
+async def test_pump_pushes_out_queue_text_downstream_as_textframe(make_session: MakeSession):
     proc, runner, sink = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
         await runner.out_queue.put("hello there")
-        await _wait_until(
+        await wait_until(
             lambda: any(isinstance(f, TextFrame) and f.text == "hello there" for f in sink.received)
         )
     finally:

@@ -39,7 +39,7 @@ ignore = ["E501"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
-strict = ["agent"]
+strict = ["agent", "tests"]
 include = ["agent", "tests"]
 exclude = [".venv", "**/__pycache__"]
 

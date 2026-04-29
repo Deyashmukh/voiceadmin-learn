@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
@@ -17,6 +20,22 @@ from agent.schemas import (
     Turn,
 )
 
+# Factory type used by the `make_session` fixture; tests use it to construct
+# a CallSession with per-test overrides applied.
+MakeSession = Callable[..., CallSession]
+
+
+async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
+    """Poll `predicate` until it returns truthy or `timeout` elapses; raise
+    AssertionError on timeout. Shared between async tests that need to wait
+    on side-effect propagation through queues / consumer tasks."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting on {predicate.__name__}")
+
 
 @dataclass
 class FakeAnthropicRepClient:
@@ -26,10 +45,12 @@ class FakeAnthropicRepClient:
     responses in order. Records each call so tests can assert on the rendered
     prompt / message history."""
 
-    responses: list[BaseModel] = field(default_factory=list)
+    responses: list[BaseModel] = field(default_factory=list[BaseModel])
     exception: Exception | None = None
     slow_mode_seconds: float = 0.0
-    calls: list[tuple[str, list[dict[str, object]]]] = field(default_factory=list)
+    calls: list[tuple[str, list[dict[str, object]]]] = field(
+        default_factory=list[tuple[str, list[dict[str, object]]]]
+    )
 
     async def complete_structured[T: BaseModel](
         self,
@@ -59,10 +80,12 @@ class FakeIVRLLMClient:
     Queue `IVRTurnResponse` instances; each call pops one. Records every
     call so tests can assert on the rendered prompt + history shape."""
 
-    responses: list[IVRTurnResponse] = field(default_factory=list)
+    responses: list[IVRTurnResponse] = field(default_factory=list[IVRTurnResponse])
     exception: Exception | None = None
     slow_mode_seconds: float = 0.0
-    calls: list[tuple[str, list[Turn], list[dict[str, object]]]] = field(default_factory=list)
+    calls: list[tuple[str, list[Turn], list[dict[str, object]]]] = field(
+        default_factory=list[tuple[str, list[Turn], list[dict[str, object]]]]
+    )
 
     async def complete_with_tools(
         self,
@@ -92,7 +115,7 @@ class FakeActuator:
     """Records every executed `SideEffectIntent`. Tests assert the runner
     called the actuator with the right intents in the right order."""
 
-    executed: list[SideEffectIntent] = field(default_factory=list)
+    executed: list[SideEffectIntent] = field(default_factory=list[SideEffectIntent])
     exception: Exception | None = None
 
     async def execute(self, intent: SideEffectIntent) -> None:
@@ -123,11 +146,11 @@ def benefits() -> Benefits:
 
 
 @pytest.fixture
-def make_session(patient: PatientInfo):
+def make_session(patient: PatientInfo) -> MakeSession:
     """Factory for `CallSession`. Per-test overrides via kwargs:
     `make_session(mode="rep", recent_menu_options=["1", "2"])`."""
 
-    def _make(**overrides) -> CallSession:
+    def _make(**overrides: Any) -> CallSession:
         s = CallSession(call_sid="CA-test", patient=patient)
         for key, value in overrides.items():
             setattr(s, key, value)

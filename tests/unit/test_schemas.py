@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from agent.schemas import (
     Benefits,
@@ -79,7 +79,7 @@ def test_speak_args_accepts_text():
         (FailWithReasonArgs, "reason", "x" * 121),
     ],
 )
-def test_string_length_bounds_rejected(model, field_name, bad_value):
+def test_string_length_bounds_rejected(model: type[BaseModel], field_name: str, bad_value: str):
     """Smoke-test that min_length / max_length declarations are wired up."""
     with pytest.raises(ValidationError):
         model(**{field_name: bad_value})
@@ -103,7 +103,9 @@ def test_record_benefit_args_field_must_be_valid():
         (None, type(None)),
     ],
 )
-def test_record_benefit_args_preserves_bool_vs_float(value, expected_type):
+def test_record_benefit_args_preserves_bool_vs_float(
+    value: bool | float | None, expected_type: type
+):
     """Pydantic v2 smart mode used to coerce False↔0.0 silently. Lock the
     distinction in — the dispatcher in M5'/B uses `value`'s type to validate
     against the field's expected type (`bool` for active/oon, `float` for
@@ -201,7 +203,9 @@ def test_tool_result_validation_failure_path():
         ("hangup", {}, HangupIntent),
     ],
 )
-def test_side_effect_intent_discriminator_round_trip(kind, extra, expected_type):
+def test_side_effect_intent_discriminator_round_trip(
+    kind: str, extra: dict[str, object], expected_type: type
+):
     """Pydantic must dispatch on `kind` when rehydrating from a dict (Langfuse
     trace replay, JSON fixtures). Without the explicit discriminator,
     smart-mode could silently coerce in ambiguous cases."""

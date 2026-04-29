@@ -15,10 +15,12 @@ from agent.schemas import (
 )
 from agent.telephony.dtmf import send_digits
 
+from .conftest import MakeSession
+
 # --- Structural arg validation (delegates to Pydantic) ----------------------
 
 
-async def test_dispatch_send_dtmf_with_invalid_args_rejected(make_session):
+async def test_dispatch_send_dtmf_with_invalid_args_rejected(make_session: MakeSession):
     """Schema-level rejection: pattern mismatch."""
     s = make_session()
     result = await tools.dispatch(ToolCall(name="send_dtmf", args={"digits": "abc"}), s)
@@ -26,13 +28,13 @@ async def test_dispatch_send_dtmf_with_invalid_args_rejected(make_session):
     assert not result.advanced_call_state
 
 
-async def test_dispatch_missing_required_arg_rejected(make_session):
+async def test_dispatch_missing_required_arg_rejected(make_session: MakeSession):
     s = make_session()
     result = await tools.dispatch(ToolCall(name="send_dtmf", args={}), s)
     assert not result.success
 
 
-async def test_dispatch_unknown_tool_name_raises_keyerror(make_session):
+async def test_dispatch_unknown_tool_name_raises_keyerror(make_session: MakeSession):
     """Locks the contract: if the `ToolName` Literal invariant is bypassed
     (e.g., a dict-built ToolCall from a Langfuse replay or a future SDK that
     doesn't validate names), the dispatcher fails loudly rather than silently
@@ -51,7 +53,7 @@ async def test_dispatch_unknown_tool_name_raises_keyerror(make_session):
 # --- send_dtmf: contextual validation ---------------------------------------
 
 
-async def test_send_dtmf_with_no_recent_menu_options_accepts_any(make_session):
+async def test_send_dtmf_with_no_recent_menu_options_accepts_any(make_session: MakeSession):
     """No menu has been seen yet → any digit goes through."""
     s = make_session()
     assert s.recent_menu_options == []
@@ -62,14 +64,14 @@ async def test_send_dtmf_with_no_recent_menu_options_accepts_any(make_session):
     assert result.side_effect.digits == "1"
 
 
-async def test_send_dtmf_with_offered_digit_accepted(make_session):
+async def test_send_dtmf_with_offered_digit_accepted(make_session: MakeSession):
     s = make_session(recent_menu_options=["1", "2", "3"])
     result = await tools.dispatch(ToolCall(name="send_dtmf", args={"digits": "2"}), s)
     assert result.success
     assert isinstance(result.side_effect, DTMFIntent)
 
 
-async def test_send_dtmf_with_unoffered_digit_rejected(make_session):
+async def test_send_dtmf_with_unoffered_digit_rejected(make_session: MakeSession):
     s = make_session(recent_menu_options=["1", "2", "3"])
     result = await tools.dispatch(ToolCall(name="send_dtmf", args={"digits": "9"}), s)
     assert not result.success
@@ -78,14 +80,14 @@ async def test_send_dtmf_with_unoffered_digit_rejected(make_session):
     assert result.side_effect is None
 
 
-async def test_send_dtmf_universal_keys_always_allowed(make_session):
+async def test_send_dtmf_universal_keys_always_allowed(make_session: MakeSession):
     """`#` and `*` are universal — accept regardless of recent menu options."""
     s = make_session(recent_menu_options=["1", "2"])
     result = await tools.dispatch(ToolCall(name="send_dtmf", args={"digits": "#"}), s)
     assert result.success
 
 
-async def test_send_dtmf_member_id_with_pound_passes_when_offered(make_session):
+async def test_send_dtmf_member_id_with_pound_passes_when_offered(make_session: MakeSession):
     """Composite digit string: `123456#`. Each char must be offered or universal."""
     s = make_session(recent_menu_options=["1", "2", "3", "4", "5", "6"])
     result = await tools.dispatch(ToolCall(name="send_dtmf", args={"digits": "123456#"}), s)
@@ -93,7 +95,7 @@ async def test_send_dtmf_member_id_with_pound_passes_when_offered(make_session):
     assert isinstance(result.side_effect, DTMFIntent)
 
 
-async def test_send_dtmf_composite_with_unoffered_digit_rejected(make_session):
+async def test_send_dtmf_composite_with_unoffered_digit_rejected(make_session: MakeSession):
     s = make_session(recent_menu_options=["1", "2", "3"])
     result = await tools.dispatch(ToolCall(name="send_dtmf", args={"digits": "129"}), s)
     assert not result.success
@@ -103,7 +105,7 @@ async def test_send_dtmf_composite_with_unoffered_digit_rejected(make_session):
 # --- speak ------------------------------------------------------------------
 
 
-async def test_speak_emits_speak_intent(make_session):
+async def test_speak_emits_speak_intent(make_session: MakeSession):
     s = make_session()
     result = await tools.dispatch(ToolCall(name="speak", args={"text": "yes, continuing"}), s)
     assert result.success
@@ -125,7 +127,9 @@ async def test_speak_emits_speak_intent(make_session):
         ("coinsurance", 0.2),
     ],
 )
-async def test_record_benefit_happy_path(make_session, field, value):
+async def test_record_benefit_happy_path(
+    make_session: MakeSession, field: str, value: bool | float
+):
     s = make_session()
     result = await tools.dispatch(
         ToolCall(name="record_benefit", args={"field": field, "value": value}), s
@@ -135,7 +139,7 @@ async def test_record_benefit_happy_path(make_session, field, value):
     assert getattr(s.benefits, field) == value
 
 
-async def test_record_benefit_bool_into_float_field_rejected(make_session):
+async def test_record_benefit_bool_into_float_field_rejected(make_session: MakeSession):
     s = make_session()
     result = await tools.dispatch(
         ToolCall(name="record_benefit", args={"field": "deductible_remaining", "value": True}), s
@@ -146,7 +150,7 @@ async def test_record_benefit_bool_into_float_field_rejected(make_session):
     assert s.benefits.deductible_remaining is None
 
 
-async def test_record_benefit_float_into_bool_field_rejected(make_session):
+async def test_record_benefit_float_into_bool_field_rejected(make_session: MakeSession):
     s = make_session()
     result = await tools.dispatch(
         ToolCall(name="record_benefit", args={"field": "active", "value": 1.0}), s
@@ -157,7 +161,7 @@ async def test_record_benefit_float_into_bool_field_rejected(make_session):
     assert s.benefits.active is None
 
 
-async def test_record_benefit_negative_float_rejected(make_session):
+async def test_record_benefit_negative_float_rejected(make_session: MakeSession):
     s = make_session()
     result = await tools.dispatch(
         ToolCall(name="record_benefit", args={"field": "copay", "value": -5.0}), s
@@ -167,7 +171,7 @@ async def test_record_benefit_negative_float_rejected(make_session):
     assert s.benefits.copay is None
 
 
-async def test_record_benefit_zero_float_accepted(make_session):
+async def test_record_benefit_zero_float_accepted(make_session: MakeSession):
     """Boundary of `< 0`: 0.0 is a valid copay (no copay due)."""
     s = make_session()
     result = await tools.dispatch(
@@ -177,7 +181,7 @@ async def test_record_benefit_zero_float_accepted(make_session):
     assert s.benefits.copay == 0.0
 
 
-async def test_record_benefit_none_value_is_accepted_no_op(make_session):
+async def test_record_benefit_none_value_is_accepted_no_op(make_session: MakeSession):
     s = make_session()
     s.benefits.copay = 30.0
     result = await tools.dispatch(
@@ -191,7 +195,7 @@ async def test_record_benefit_none_value_is_accepted_no_op(make_session):
 # --- transfer_to_rep --------------------------------------------------------
 
 
-async def test_transfer_to_rep_flips_mode(make_session):
+async def test_transfer_to_rep_flips_mode(make_session: MakeSession):
     s = make_session()
     assert s.mode == "ivr"
     result = await tools.dispatch(ToolCall(name="transfer_to_rep", args={}), s)
@@ -200,7 +204,7 @@ async def test_transfer_to_rep_flips_mode(make_session):
     assert result.side_effect is None
 
 
-async def test_transfer_to_rep_idempotent_when_already_rep(make_session):
+async def test_transfer_to_rep_idempotent_when_already_rep(make_session: MakeSession):
     """Calling transfer_to_rep twice doesn't break anything."""
     s = make_session(mode="rep")
     result = await tools.dispatch(ToolCall(name="transfer_to_rep", args={}), s)
@@ -211,7 +215,7 @@ async def test_transfer_to_rep_idempotent_when_already_rep(make_session):
 # --- complete_call ----------------------------------------------------------
 
 
-async def test_complete_call_sets_completion_reason_and_emits_hangup(make_session):
+async def test_complete_call_sets_completion_reason_and_emits_hangup(make_session: MakeSession):
     s = make_session()
     result = await tools.dispatch(
         ToolCall(name="complete_call", args={"reason": "benefits_extracted"}), s
@@ -222,7 +226,7 @@ async def test_complete_call_sets_completion_reason_and_emits_hangup(make_sessio
     assert isinstance(result.side_effect, HangupIntent)
 
 
-async def test_complete_call_invalid_reason_rejected(make_session):
+async def test_complete_call_invalid_reason_rejected(make_session: MakeSession):
     s = make_session()
     result = await tools.dispatch(ToolCall(name="complete_call", args={"reason": "bogus"}), s)
     assert not result.success
@@ -233,7 +237,7 @@ async def test_complete_call_invalid_reason_rejected(make_session):
 # --- fail_with_reason -------------------------------------------------------
 
 
-async def test_fail_with_reason_in_ivr_mode_completes_as_llm_aborted(make_session):
+async def test_fail_with_reason_in_ivr_mode_completes_as_llm_aborted(make_session: MakeSession):
     """Distinct from `ivr_no_progress` (the watchdog's reason) so dashboards
     can tell deliberate LLM aborts apart from watchdog timeouts."""
     s = make_session(mode="ivr")
@@ -249,7 +253,7 @@ async def test_fail_with_reason_in_ivr_mode_completes_as_llm_aborted(make_sessio
     assert isinstance(result.side_effect, HangupIntent)
 
 
-async def test_fail_with_reason_in_rep_mode_completes_as_llm_aborted(make_session):
+async def test_fail_with_reason_in_rep_mode_completes_as_llm_aborted(make_session: MakeSession):
     s = make_session(mode="rep")
     result = await tools.dispatch(
         ToolCall(name="fail_with_reason", args={"reason": "rep refused to disclose"}),

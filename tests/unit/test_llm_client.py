@@ -23,7 +23,7 @@ def rep_output() -> RepTurnOutput:
 
 
 def _patched_client(
-    parse_returns, response_id: str = "msg_test"
+    parse_returns: object, response_id: str = "msg_test"
 ) -> tuple[AnthropicRepClient, AsyncMock]:
     """Build an AnthropicRepClient whose AsyncAnthropic surface is mocked.
 
@@ -63,13 +63,13 @@ def test_anthropic_rep_client_requires_api_key(monkeypatch: pytest.MonkeyPatch):
 def test_anthropic_rep_client_accepts_explicit_key(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     client = AnthropicRepClient(api_key="sk-explicit")
-    assert client._client is not None  # constructor succeeded
+    assert client._client is not None  # pyright: ignore[reportPrivateUsage]
 
 
 def test_anthropic_rep_client_reads_env_var_when_no_key(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
     client = AnthropicRepClient()
-    assert client._client is not None
+    assert client._client is not None  # pyright: ignore[reportPrivateUsage]
 
 
 # --- complete_structured: happy path + call shape --------------------------
@@ -180,7 +180,7 @@ async def test_complete_structured_propagates_cancellation(rep_output: RepTurnOu
     M5'/D depend on this for barge-in cancellation to actually abort the LLM."""
     import asyncio
 
-    async def _slow_parse(*_args, **_kwargs):
+    async def _slow_parse(*_args: object, **_kwargs: object):
         await asyncio.sleep(10.0)
         return MagicMock()
 
