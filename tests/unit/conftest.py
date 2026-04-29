@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple, Protocol, TypedDict, Unpack
@@ -63,14 +62,31 @@ class IVRCall(NamedTuple):
 
 
 async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
-    """Poll `predicate` until it returns truthy or `timeout` elapses; raise
-    AssertionError on timeout. Shared between async tests that need to wait
-    on side-effect propagation through queues / consumer tasks."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    """Yield to the event loop until ``predicate`` returns truthy, or fail after
+    a bounded number of iterations.
+
+    Approach (M8'/H — Option B, finite-iteration cap with no wall-clock
+    deadline). The previous implementation polled ``time.monotonic()`` against a
+    deadline and slept 10 ms between checks. Under CPU pressure (e.g. structlog
+    rich-traceback rendering taking >1 s synchronously) the deadline elapsed
+    before the event loop ever resumed our coroutine, producing nondeterministic
+    timeouts. The new helper depends only on event-loop progress: each iteration
+    yields once via ``asyncio.sleep(0.001)``, giving ready tasks (and timer-
+    driven sleeps in fakes such as ``slow_mode_seconds``) a chance to run, then
+    re-checks the predicate. The cap is in iterations, not wall-clock seconds —
+    so a slow scheduler does not cause spurious failures, only a genuinely
+    stuck predicate does. ``timeout`` is retained for signature compatibility
+    and converted to an iteration budget at 1 ms per iteration; tests reading
+    ``timeout=1.0`` still get a ~1 s budget under a healthy loop, but no longer
+    fail when wall-clock advances faster than the loop schedules them.
+    """
+    # 1 ms per iteration → `timeout` seconds maps to `timeout * 1000` iterations.
+    # Floor at 1 to keep `timeout=0` from short-circuiting the first check.
+    max_iterations = max(1, int(timeout * 1000))
+    for _ in range(max_iterations):
         if predicate():
             return
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.001)
     raise AssertionError(f"timed out waiting on {predicate.__name__}")
 
 
