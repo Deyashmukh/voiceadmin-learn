@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+import pytest
 import structlog.contextvars
 
 from agent import tools
@@ -111,6 +112,59 @@ async def test_call_completion_appends_jsonl_record(make_session: MakeSession):
     assert record["patient"]["member_id"] == runner.session.patient.member_id
     assert "benefits" in record
     assert "completed_at" in record
+
+
+async def test_jsonl_append_does_not_overwrite_prior_calls(make_session: MakeSession):
+    """JSONL was chosen over a single-array file precisely so back-to-back
+    completions don't race read-modify-write. Two calls must produce two
+    distinct lines, both readable. Catches a regression where someone
+    flips `"a"` to `"w"` on the file open and silently drops history."""
+
+    async def _run_one_completed_call(sid: str) -> None:
+        session = make_session()
+        session.call_sid = sid
+        runner, ivr_llm, _rep = _build_runner(session, actuator=FakeActuator())
+        ivr_llm.responses = [
+            IVRTurnResponse(
+                tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+            )
+        ]
+        try:
+            await runner.start()
+            runner.submit_transcript("Thank you, goodbye.")
+            await wait_until(lambda: runner.session.done)
+        finally:
+            await runner.stop()
+
+    await _run_one_completed_call("CA-call-A")
+    await _run_one_completed_call("CA-call-B")
+    log_path = Path(os.environ["BENEFITS_LOG_PATH"])
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 2, f"expected 2 entries, got {len(lines)}"
+    sids = {json.loads(line)["call_sid"] for line in lines}
+    assert sids == {"CA-call-A", "CA-call-B"}, f"expected both sids, got {sids}"
+
+
+async def test_jsonl_write_failure_does_not_abort_call(
+    make_session: MakeSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Best-effort logging contract: a failed write must not propagate into
+    call teardown. Point `BENEFITS_LOG_PATH` at a path inside a non-existent
+    directory; the consumer must still finish cleanly."""
+    monkeypatch.setenv("BENEFITS_LOG_PATH", str(tmp_path / "missing-dir" / "benefits.jsonl"))
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+        )
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("Thank you, goodbye.")
+        await wait_until(lambda: runner.session.done)
+    finally:
+        await runner.stop()
+    assert runner.session.completion_reason == "benefits_extracted"
 
 
 async def test_ivr_turn_dispatches_send_dtmf_intent(make_session: MakeSession):

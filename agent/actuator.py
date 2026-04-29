@@ -4,10 +4,15 @@ The tools layer is a pure function — it returns `ToolResult` plus an optional
 `SideEffectIntent`. The actuator turns those intents into real side effects:
 
 - `SpeakIntent` → push text into `session.out_queue`. The `state_processor`
-  Pipecat adapter pumps the queue into `TextFrame`s for Cartesia. This avoids
-  coupling the actuator to the FrameProcessor.
-- `DTMFIntent` → call Twilio REST `<Play digits>` via `agent.telephony.dtmf`.
-  Requires a Twilio client and the live `call_sid`.
+  Pipecat adapter pumps the queue into `TTSSpeakFrame`s, which the configured
+  TTS service synthesizes. This avoids coupling the actuator to the
+  FrameProcessor.
+- `DTMFIntent` → TEMP: speaks the digit aloud via `out_queue` instead of
+  generating real DTMF audio. The previous Twilio REST `<Play digits>` path
+  replaced the active TwiML and ended the call. The real fix is generating
+  DTMF dual-tone PCM and emitting it as `OutputAudioRawFrame` over the
+  Media Stream — see TODO(DTMF) in execute(). Until that lands, this stand-in
+  works for voice-roleplay testing only and MUST NOT run against a real payer.
 - `HangupIntent` → no immediate I/O; the runner observes
   `session.completion_reason` (set by `complete_call` / `fail_with_reason` in
   the dispatcher) and exits the consume loop. The intent is still returned
@@ -36,8 +41,9 @@ class Actuator(Protocol):
 class CallActuator:
     """Per-call actuator. One per `CallSessionRunner`.
 
-    `twilio_client` is optional — offline unit tests omit it and any
-    `DTMFIntent` raises. Live calls inject the real `twilio.rest.Client`.
+    `twilio_client` is currently unused — the DTMF path is a TEMP TTS
+    stand-in (see module docstring); the parameter stays on the
+    constructor so the real DTMF wiring can land without API churn.
     """
 
     def __init__(
@@ -60,12 +66,13 @@ class CallActuator:
                 # rather than dropping spoken text on the floor.
                 await self.out_queue.put(intent.text)
             case DTMFIntent():
-                # TEMP: Twilio's REST `<Play digits>` update replaces the active
-                # TwiML and ends the call. Until we generate DTMF tones as audio
-                # and push them through the WSS as OutputAudioRawFrame (the real
-                # fix), we stand in by speaking the digits aloud. For the
-                # voice-roleplay test this is enough — the human IVR-roleplayer
-                # hears "press one" and advances. Production-correct DTMF must
+                # TODO(DTMF): Twilio's REST `<Play digits>` update replaces the
+                # active TwiML and ends the call. Until we generate DTMF tones
+                # as audio and push them through the WSS as OutputAudioRawFrame
+                # (the real fix), we stand in by speaking the digits aloud. For
+                # the voice-roleplay test this is enough — the human IVR-
+                # roleplayer hears "press one" and advances. Production-correct
+                # DTMF must
                 # land before this code goes anywhere near a real payer.
                 await self.out_queue.put(f"Pressing {intent.digits}.")
             case HangupIntent():

@@ -34,14 +34,9 @@ from agent.logging_config import log
 
 _VAD_STOPPED_GRACE_S = 0.7
 """Cooldown after VAD signals end-of-speech before flushing buffered
-transcripts. We use VAD's actual end-of-speech signal (rather than a
-wall-clock debounce on transcript arrival) so the flush adapts to the
-caller's real cadence. 0.7s is longer than typical inter-option pauses in
-recorded payer IVRs (300-500ms) — so a multi-sentence menu doesn't
-fragment — but short enough that conversation in rep mode feels live.
-Combined with Silero's internal stop threshold (~800ms of silence before
-declaring `stopped`), end-to-end flush latency after a menu finishes is
-~1.5s — about 60% faster than the prior 4s wall-clock debounce."""
+transcripts. 0.7s is longer than typical inter-option pauses in recorded
+payer IVRs (300-500ms) — so a multi-sentence menu doesn't fragment — but
+short enough that conversation in rep mode feels live."""
 
 
 class StateMachineProcessor(FrameProcessor):
@@ -145,7 +140,16 @@ class StateMachineProcessor(FrameProcessor):
         self._transcript_buffer.clear()
         self._runner.mark_interrupted()
         if downstream_interruption:
-            await self.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            try:
+                await self.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Runner is already cancelled but TTS may still be playing
+                # buffered audio. The user will hear the agent finish
+                # talking after their barge-in — a UX defect. Log loudly
+                # so a stuck-tail-audio symptom is greppable.
+                log.error("barge_in_downstream_push_failed", error=str(exc))
 
     def _schedule_flush(self) -> None:
         """Arm a delayed flush of the transcript buffer. Called when VAD

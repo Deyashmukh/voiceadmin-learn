@@ -180,6 +180,34 @@ async def test_vad_driven_flush_aggregates_menu_into_one_submission(
     assert runner.in_queue.empty()
 
 
+async def test_late_transcript_after_grace_schedules_fresh_flush(make_session: MakeSession):
+    """Deepgram can lag VAD by hundreds of ms. If a TranscriptionFrame
+    arrives AFTER the VAD-stopped grace already expired (and the flush
+    ran on an empty buffer), the late transcript must trigger a fresh
+    flush — not sit in the buffer forever waiting for the next
+    VAD-stopped that may never come.
+
+    Locks the late-transcript fallback: removing the
+    `if not self._speech_active and self._flush_task is None: schedule`
+    branch in process_frame would silently drop late transcripts.
+    """
+    proc, runner, _ = await _make_processor(make_session, vad_stopped_grace_s=0.05)
+    await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    await proc.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    # Wait for the grace to expire on an empty buffer. The flush task
+    # runs, finds the buffer empty, returns early, and clears
+    # `_flush_task` in its `finally`.
+    await wait_until(
+        lambda: proc._flush_task is None,  # pyright: ignore[reportPrivateUsage]
+        timeout=2.0,
+    )
+    assert runner.in_queue.empty()
+    # Now Deepgram catches up with a late final.
+    await proc.process_frame(_transcription("late text"), FrameDirection.DOWNSTREAM)
+    await wait_until(lambda: not runner.in_queue.empty(), timeout=2.0)
+    assert runner.in_queue.get_nowait() == "late text"
+
+
 async def test_vad_restart_during_grace_cancels_pending_flush(make_session: MakeSession):
     """Inter-option pause: VAD reports stopped, then re-started before the
     grace period elapses. The pending flush must cancel — fragmenting a
@@ -261,20 +289,32 @@ async def test_vad_barge_in_pushes_interruption_frame_downstream(
     downstream so Pipecat's TTS service stops mid-synthesis and the output
     transport drops any buffered audio. Without this, the agent keeps
     talking over the user for several beats after the interrupt is logged.
+
+    Asserts EXACTLY ONE synthesized `InterruptionFrame` lands at the sink
+    per barge-in — not just `>=1` — so a future refactor that double-
+    pushes (or drops the synthesis) is caught immediately. The trailing
+    `await self.push_frame(frame, direction)` in `process_frame` re-emits
+    the original `VADUserStartedSpeakingFrame`, which is a different type
+    and doesn't satisfy the assertion.
     """
     proc, runner, sink = await _make_processor(make_session)
     try:
         await proc.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
         await proc.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        baseline_interrupts = sum(1 for f in sink.received if isinstance(f, InterruptionFrame))
         await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-        # Two InterruptionFrames reach the sink: the one we synthesized
-        # for the downstream TTS-clear, plus the original VAD frame as it
-        # passes through (push_frame at the end of process_frame). We
-        # assert at least one InterruptionFrame is present.
-        assert any(isinstance(f, InterruptionFrame) for f in sink.received), (
-            f"expected InterruptionFrame in {[type(f).__name__ for f in sink.received]}"
+        new_interrupts = (
+            sum(1 for f in sink.received if isinstance(f, InterruptionFrame)) - baseline_interrupts
         )
-        # Also re-assert the runner side: queues drained.
+        assert new_interrupts == 1, (
+            f"expected exactly one new InterruptionFrame after barge-in, "
+            f"got {new_interrupts}; sink contents: "
+            f"{[type(f).__name__ for f in sink.received]}"
+        )
+        # Re-assert the runner side: queues drained on barge-in. Use a
+        # fresh BotStartedSpeakingFrame because the prior barge-in left
+        # `_bot_speaking` False (no Stopped frame fired).
+        await proc.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         await runner.out_queue.put("would-be-stale")
         await proc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         assert runner.out_queue.empty()

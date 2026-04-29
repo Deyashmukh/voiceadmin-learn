@@ -6,6 +6,17 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from groq import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+    UnprocessableEntityError,
+)
 
 from agent.errors import ConfigurationError, LLMRefusalError
 from agent.llm_client import (
@@ -406,6 +417,69 @@ async def test_groq_client_passes_call_args_to_sdk():
     assert kwargs["temperature"] == 0.2
     assert kwargs["tools"] == [{"x": 1}]
     assert kwargs["max_tokens"] == 512
+
+
+def _groq_client_raising(exc: Exception) -> GroqToolCallingClient:
+    """Build a Groq client whose `chat.completions.create` raises `exc`. Used
+    to pin the consumer-survival contract: provider-side errors must be
+    swallowed; everything else must propagate so misconfigs surface."""
+    create_mock = AsyncMock(side_effect=exc)
+    fake_completions = MagicMock(create=create_mock)
+    fake_chat = MagicMock(completions=fake_completions)
+    fake_async = MagicMock(chat=fake_chat)
+    return GroqToolCallingClient(client=fake_async)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BadRequestError(
+            "tool_use_failed",
+            response=MagicMock(status_code=400),
+            body={"error": {"code": "tool_use_failed"}},
+        ),
+        UnprocessableEntityError(
+            "unprocessable",
+            response=MagicMock(status_code=422),
+            body={"error": {}},
+        ),
+        APIConnectionError(request=MagicMock()),
+        APITimeoutError(request=MagicMock()),
+    ],
+    ids=["bad_request", "unprocessable", "connection_error", "timeout"],
+)
+async def test_groq_client_degrades_provider_errors_to_empty_response(exc: Exception):
+    """Provider-side input rejection or transient network blip must NOT kill
+    the call-session consumer. Returning an empty IVRTurnResponse counts as a
+    no-progress turn — the watchdog handles persistent failure. Locks the
+    consumer-survival contract; a regression that re-raises here would crash
+    a live call mid-turn."""
+    client = _groq_client_raising(exc)
+    result = await client.complete_with_tools(system="x", history=[], tools=[])
+    assert result.tool_calls == []
+    assert result.text == ""
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        AuthenticationError("bad key", response=MagicMock(status_code=401), body={"error": {}}),
+        PermissionDeniedError("no perms", response=MagicMock(status_code=403), body={"error": {}}),
+        NotFoundError("model gone", response=MagicMock(status_code=404), body={"error": {}}),
+        RateLimitError("slow down", response=MagicMock(status_code=429), body={"error": {}}),
+        InternalServerError("groq down", response=MagicMock(status_code=500), body={"error": {}}),
+        TypeError("programmer bug"),
+    ],
+    ids=["auth", "permission", "not_found", "rate_limit", "internal_server", "type_error"],
+)
+async def test_groq_client_propagates_misconfig_and_real_bugs(exc: Exception):
+    """Auth / permission / rate-limit / not-found / 5xx / programmer bugs
+    must propagate so misconfigs and regressions surface immediately
+    instead of looking like a confused LLM that the watchdog terminates
+    after wasting two turns."""
+    client = _groq_client_raising(exc)
+    with pytest.raises(type(exc)):
+        await client.complete_with_tools(system="x", history=[], tools=[])
 
 
 # --- _history_to_groq_messages tests ---------------------------------------

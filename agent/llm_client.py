@@ -11,7 +11,13 @@ from typing import Any, cast, get_args
 
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
-from groq import AsyncGroq
+from groq import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncGroq,
+    BadRequestError,
+    UnprocessableEntityError,
+)
 from pydantic import BaseModel, ValidationError
 
 from agent.errors import ConfigurationError, LLMRefusalError, LLMStopReason
@@ -164,23 +170,26 @@ class GroqToolCallingClient:
                 # `required`: every IVR turn must produce exactly one tool
                 # call. Determinism > forgiveness — the watchdog can
                 # terminate a call that's making bad presses, but the
-                # alternative (silent inaction) deadlocks the call. The
-                # 4s debounce upstream collapses fragmentary input into
-                # whole menus so the LLM has good context per call. The
-                # `except` below converts a Groq 4xx
-                # (`tool_use_failed` for un-classifiable input) into a
-                # no-progress turn instead of killing the consumer.
+                # alternative (silent inaction) deadlocks the call.
                 tool_choice="required",
                 temperature=temperature,
                 max_tokens=512,
             )
-        except Exception as exc:
-            # Any 4xx / 5xx / network glitch from Groq must NOT propagate up
-            # and kill the call-session consumer. Returning an empty
-            # IVRTurnResponse counts as a no-progress turn — two in a row
-            # trips the watchdog, which is the right termination story for a
-            # provider that's persistently failing.
-            log.warning("ivr_llm_call_failed", error=str(exc)[:300])
+        except (
+            BadRequestError,
+            UnprocessableEntityError,
+            APIConnectionError,
+            APITimeoutError,
+        ) as exc:
+            # Provider-side input rejection (e.g. `tool_use_failed` for
+            # un-classifiable input) or transient network blip — don't kill
+            # the consumer. Empty response counts as a no-progress turn;
+            # two in a row trips the watchdog. AuthenticationError /
+            # PermissionDeniedError / RateLimitError / NotFoundError /
+            # InternalServerError plus any non-Groq exception (programmer
+            # bugs, schema drift) intentionally propagate so misconfigs
+            # surface immediately instead of looking like a confused LLM.
+            log.warning("ivr_llm_call_failed", error=str(exc)[:1500])
             return IVRTurnResponse(tool_calls=[], text="")
         choice = response.choices[0]
         msg = choice.message
