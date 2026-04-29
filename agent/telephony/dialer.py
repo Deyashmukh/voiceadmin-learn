@@ -8,6 +8,27 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Protocol
+
+
+class _TwilioCallInstance(Protocol):
+    """The fields we read on a placed Twilio call. Restricted to `sid` —
+    expanding this to mirror Twilio's full `CallInstance` would couple us to
+    SDK internals; pyright will fail if we ever read more without updating
+    here."""
+
+    sid: str
+
+
+class _TwilioCalls(Protocol):
+    """Structural shape of the `.calls` resource on a Twilio REST client.
+    Test mocks satisfy this without inheriting any Twilio types."""
+
+    def create(self, *, to: str, from_: str, url: str | None) -> _TwilioCallInstance: ...
+
+
+class TwilioClientLike(Protocol):
+    calls: _TwilioCalls
 
 
 class DestinationNotAllowedError(Exception):
@@ -35,7 +56,7 @@ def dial(
     to: str,
     from_: str,
     *,
-    twilio_client=None,
+    twilio_client: TwilioClientLike | None = None,
     url: str | None = None,
     allowlist: frozenset[str] | None = None,
 ) -> DialResult:

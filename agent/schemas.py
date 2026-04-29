@@ -118,7 +118,7 @@ class IVRTurnResponse(BaseModel):
     like 'one moment' before a DTMF). Empty `tool_calls` is the watchdog's
     no-progress signal."""
 
-    tool_calls: list[ToolCall] = Field(default_factory=list)
+    tool_calls: list[ToolCall] = Field(default_factory=list[ToolCall])
     text: str = ""
 
 
@@ -203,12 +203,12 @@ class CallSession:
     # All Turn entries appended in chronological order: user transcripts,
     # assistant replies, tool_call entries, tool_result entries. Rendered into
     # LLM prompts as text rather than consumed structurally.
-    history: list[Turn] = field(default_factory=list)
+    history: list[Turn] = field(default_factory=list[Turn])
     benefits: Benefits = field(default_factory=Benefits)
     # Populated when a transcript looks like a menu prompt (parsed in the IVR
     # turn handler). `send_dtmf` validation rejects digits not in this list;
     # universal #/* are always allowed.
-    recent_menu_options: list[str] = field(default_factory=list)
+    recent_menu_options: list[str] = field(default_factory=list[str])
     # Distinct from `len(history)` because history mixes user/assistant/tool
     # entries. Counts completed turns from the per-turn loop's perspective:
     # one increment per `_run_turn` invocation that didn't get cancelled.

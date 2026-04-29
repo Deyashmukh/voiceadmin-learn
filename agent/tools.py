@@ -13,10 +13,9 @@ from a rejection round-trip.
 
 from __future__ import annotations
 
-from langfuse import observe
 from pydantic import BaseModel, ValidationError
 
-from agent.observability import set_current_span_name
+from agent.observability import observe, set_current_span_name
 from agent.schemas import (
     BenefitField,
     CallSession,
