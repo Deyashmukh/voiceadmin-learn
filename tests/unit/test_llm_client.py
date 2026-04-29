@@ -152,13 +152,29 @@ async def test_complete_structured_raises_when_parsed_output_is_none():
     Surface explicitly so callers can fall back rather than crash with
     AttributeError downstream. Error message must include the response id so
     the failure is correlatable in Langfuse / dashboards."""
-    client, _ = _patched_client(parse_returns=None, response_id="msg_refused_xyz")
+    client, parse_mock = _patched_client(parse_returns=None, response_id="msg_refused_xyz")
+    # Set a realistic refusal stop_reason so the assertion locks the
+    # provider-value passthrough rather than the fixture default.
+    parse_mock.return_value.stop_reason = "refusal"
     with pytest.raises(LLMRefusalError) as exc_info:
         await client.complete_structured(
             system="x", history=[{"role": "user", "content": "y"}], schema=RepTurnOutput
         )
     assert exc_info.value.response_id == "msg_refused_xyz"
-    assert exc_info.value.stop_reason == "end_turn"  # from _patched_client default
+    assert exc_info.value.stop_reason == "refusal"
+
+
+async def test_complete_structured_falls_back_to_unknown_on_unrecognized_stop_reason():
+    """If the SDK ever returns a stop_reason outside the known Literal set
+    (new Anthropic value, garbled response), the client narrows to
+    `unknown` so dashboards don't bucket on typos."""
+    client, parse_mock = _patched_client(parse_returns=None, response_id="msg_x")
+    parse_mock.return_value.stop_reason = "pause_turn"  # hypothetical future reason
+    with pytest.raises(LLMRefusalError) as exc_info:
+        await client.complete_structured(
+            system="x", history=[{"role": "user", "content": "y"}], schema=RepTurnOutput
+        )
+    assert exc_info.value.stop_reason == "unknown"
 
 
 async def test_complete_structured_extracts_usage_from_response(rep_output: RepTurnOutput):

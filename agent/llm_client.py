@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam
@@ -23,6 +23,11 @@ REP_MODEL = "claude-haiku-4-5"
 # Llama 4 Scout via Groq — fast first-token latency (~80ms p50), tool
 # calling supported, $0.11/$0.34 per 1M in/out at the time of writing.
 IVR_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# Runtime-validated set of recognized LLM stop reasons. Anything outside
+# this falls back to "unknown" so dashboard aggregations don't bucket on
+# typos / new SDK values we haven't classified yet.
+_KNOWN_STOP_REASONS: frozenset[str] = frozenset(get_args(LLMStopReason))
 
 
 class AnthropicRepClient:
@@ -82,9 +87,13 @@ class AnthropicRepClient:
         parsed = response.parsed_output
         if parsed is None:
             # Refusal or schema mismatch — surface explicitly so callers can fall back.
-            # `stop_reason` and `response_id` go on the typed error so the
-            # caller can correlate without parsing the message.
-            stop: LLMStopReason = getattr(response, "stop_reason", "unknown")
+            # The raw value is `Any` from `getattr`; narrow against the Literal
+            # set so an SDK that adds a new stop reason doesn't silently leak
+            # an unrecognized string into Langfuse aggregations.
+            raw_stop = getattr(response, "stop_reason", "unknown")
+            stop: LLMStopReason = (
+                cast(LLMStopReason, raw_stop) if raw_stop in _KNOWN_STOP_REASONS else "unknown"
+            )
             request_id = getattr(response, "id", "unknown")
             raise LLMRefusalError(
                 f"Anthropic messages.parse() returned no parsed_output "

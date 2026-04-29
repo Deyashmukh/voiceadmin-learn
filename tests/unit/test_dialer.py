@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.errors import ConfigurationError
 from agent.telephony.dialer import (
     DestinationNotAllowedError,
     check_destination,
@@ -66,3 +67,19 @@ def test_dial_calls_twilio_for_listed_destination() -> None:
 def test_empty_allowlist_rejects_everything() -> None:
     with pytest.raises(DestinationNotAllowedError):
         check_destination("+15551112222", frozenset())
+
+
+def test_dial_without_twilio_client_raises_configuration_error() -> None:
+    """`dial()` requires `twilio_client`; absence is a wiring bug, not a
+    runtime failure. Allowlist check passes first (so this exercises the
+    None-client branch, not the fence)."""
+    allowlist = frozenset({"+15551112222"})
+    with pytest.raises(ConfigurationError) as exc_info:
+        dial(
+            to="+15551112222",
+            from_="+15550000000",
+            twilio_client=None,
+            url="https://example.test/twiml",
+            allowlist=allowlist,
+        )
+    assert exc_info.value.setting == "twilio_client"
