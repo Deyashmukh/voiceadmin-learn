@@ -55,7 +55,7 @@ _TOOL_DESCRIPTIONS: dict[ToolName, str] = {
     ),
     "record_benefit": (
         "Record a benefit field value the IVR (or rep) read aloud. "
-        "Examples: copay=30.0, active=True."
+        "Examples: copay=30.0, active=true."
     ),
     "transfer_to_rep": (
         "Mark that the call has been handed off to a human rep. After this, "

@@ -428,8 +428,8 @@ def test_history_to_groq_messages_synthesizes_id_when_missing():
         Turn(role="tool_result", content="Speaking."),
     ]
     msgs = _history_to_groq_messages("sys", history)
-    assert msgs[1]["tool_calls"][0]["id"] == "call_0"  # type: ignore[index, call-overload]
-    assert msgs[2]["tool_call_id"] == "call_0"
+    assert msgs[1]["tool_calls"][0]["id"] == "call_0_speak"  # type: ignore[index, call-overload]
+    assert msgs[2]["tool_call_id"] == "call_0_speak"
 
 
 def test_history_to_groq_messages_skips_unpaired_tool_result():

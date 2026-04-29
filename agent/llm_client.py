@@ -14,6 +14,7 @@ from anthropic.types import MessageParam
 from groq import AsyncGroq
 from pydantic import BaseModel, ValidationError
 
+from agent.logging_config import log
 from agent.observability import enrich_current_generation, observe
 from agent.schemas import IVRTurnResponse, ToolCall, ToolName, Turn
 
@@ -157,13 +158,26 @@ class GroqToolCallingClient:
             try:
                 args = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
-                continue  # malformed JSON — dispatcher would reject anyway
+                # Without this log the no-progress watchdog would see "0 tool
+                # calls" with no signal that the LLM tried but emitted garbage.
+                log.warning(
+                    "ivr_tool_call_dropped",
+                    reason="malformed_json",
+                    name=tc.function.name,
+                    raw_args=tc.function.arguments,
+                )
+                continue
             try:
                 parsed_calls.append(
                     ToolCall(name=cast(ToolName, tc.function.name), args=args, id=tc.id)
                 )
             except ValidationError:
-                continue  # hallucinated tool name — dispatcher would 500 on lookup
+                log.warning(
+                    "ivr_tool_call_dropped",
+                    reason="hallucinated_name",
+                    name=tc.function.name,
+                )
+                continue
         enrich_current_generation(model=self._model, usage=_groq_usage(response))
         return IVRTurnResponse(tool_calls=parsed_calls, text=msg.content or "")
 
@@ -188,7 +202,10 @@ def _history_to_groq_messages(system: str, history: list[Turn]) -> list[dict[str
             i += 1
         elif turn.role == "tool_call" and turn.tool_call is not None:
             tc = turn.tool_call
-            tc_id = tc.id or f"call_{i}"
+            # Synthesized ids are local to this conversion (not persistent
+            # across turns). They only appear when the SDK omits one — Groq
+            # always provides ids in practice; this is a defensive fallback.
+            tc_id = tc.id or f"call_{i}_{tc.name}"
             messages.append(
                 {
                     "role": "assistant",
