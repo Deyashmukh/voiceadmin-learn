@@ -67,22 +67,24 @@ These matter only when real users call the agent. We're not deploying.
 
 - Docker for the agent itself (Langfuse uses Docker Compose, but the agent runs with `uv run`).
 - OpenTelemetry / Prometheus / custom production metrics (Langfuse covers LLM traces).
-- `tenacity` or any retry framework (hand-write the one or two retries that improve correctness).
 - Multiple env profiles beyond a single `.env`.
 - Separate fallback nodes for `CLARIFICATION`, `WAIT`, `RETRY` — one fallback node, split only if M7' forces it.
 - Health checks, readiness probes, IaC, secrets managers, alerting, multi-region, persistence layer — all deployment infrastructure.
+
+Note on retry handling: there are currently ≤2 retry surfaces (LLM 429 backoff, Twilio API blip). Hand-rolled retries with explicit per-call budget are clearer than a framework at this scale. Revisit `tenacity` if a third surface appears or the budget logic gets non-trivial.
 
 ## Things we DO require for production-grade dev quality
 
 These matter even without real users — the difference between a learning project that hides bugs and one that catches them. Tracked as M8' milestones in `docs/plan.md`.
 
-- **Pyright strict mode**, per-file with explicit `# pyright: strict` and explicit `# type: ignore[X]` for the few real Pipecat snags. Basic mode hides bugs at boundaries.
-- **GitHub Actions CI** running `ruff + pyright + pytest` on every PR. Pre-commit is bypassable; CI is the gate.
-- **Test coverage thresholds** via `pytest-cov` (95% on `agent/call_session.py`, 90% on `agent/tools.py`, lower on entrypoints).
+- **Pyright strict mode**, per-file with explicit `# pyright: strict` and explicit `# type: ignore[X]` for the few real Pipecat type-stub gaps.
+- **GitHub Actions CI** running `ruff + pyright + pytest` on every PR. Pre-commit is bypassable; CI is the gate. Ruff rule set extended with `SIM` + `RUF` on top of the current `E,F,I,B,UP,N,W`.
+- **Test coverage thresholds** via `pytest-cov`, calibrated against first measurement (don't pin numbers ahead of measurement).
 - **Hypothesis property-based tests** for the tool dispatcher's combinatorial validation matrix.
 - **Error taxonomy** (`AgentError` base + specific subclasses). No string-matching on `RuntimeError` messages; callers catch by type.
-- **Barge-in latency regression test** — `cancel-to-silence < 150ms` (M2's quantitative gate) must keep holding through future changes.
+- **Barge-in latency regression test** — measure first, then assert against the measured baseline plus reasonable headroom. The historical `<150ms` figure was an M2 manual observation, not yet enforced in code.
 - **`pip-audit` in CI** — catches CVE'd transitive deps.
+- **Secret scanning** (`gitleaks` or equivalent) — pre-merge gate, given the credentials this repo touches.
 - **Determinism in async tests** — fake clocks for timing-sensitive tests; no flaky polling.
 
 ## Architectural non-negotiables
