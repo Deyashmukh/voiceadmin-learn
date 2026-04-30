@@ -8,6 +8,7 @@ from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
+import structlog.testing
 
 from agent import tools
 from agent.schemas import (
@@ -285,6 +286,31 @@ async def test_send_dtmf_purpose_rep_sets_session_flag(make_session: MakeSession
     assert s.rep_pending
 
 
+async def test_send_dtmf_purpose_rep_emits_audit_log(make_session: MakeSession):
+    """Arming `rep_pending` MUST emit a structured `rep_digit_pressed`
+    event so post-mortems can distinguish 'rep never arrived' from
+    'wrong digit pressed'. Without this log, the only audit signal would
+    be the tool_call entry in history — which can be torn by mid-turn
+    cancellation. Locks the observability contract added in this PR.
+    """
+    s = make_session()
+    s.recent_menu_options = ["1", "2", "9"]
+    with structlog.testing.capture_logs() as captured:
+        result = await tools.dispatch(
+            ToolCall(name="send_dtmf", args={"digits": "9", "purpose": "rep"}),
+            s,
+        )
+    assert result.success
+    arming_events = [
+        e
+        for e in captured
+        if e.get("event") == "rep_digit_pressed" and e.get("log_level") == "info"
+    ]
+    assert len(arming_events) == 1
+    assert arming_events[0]["digits"] == "9"
+    assert arming_events[0]["recent_menu_options"] == ["1", "2", "9"]
+
+
 async def test_send_dtmf_default_purpose_does_not_set_rep_flag(make_session: MakeSession):
     """Default `purpose='menu'` (omitted) leaves `rep_pending=False`. Catches
     a regression where the default flips to `rep` or the field becomes
@@ -333,6 +359,22 @@ async def test_wait_after_transfer_is_free(make_session: MakeSession):
     assert not s.rep_pending  # transfer cleared the flag
     result = await tools.dispatch(ToolCall(name="wait", args={}), s)
     assert result.success
+    assert s.ivr_wait_started_at is None
+
+
+async def test_transfer_to_rep_clears_both_transition_flags(make_session: MakeSession):
+    """Belt-and-suspenders: `transfer_to_rep` must explicitly clear BOTH
+    `rep_pending` AND `ivr_wait_started_at`. The dispatch-entry reset
+    handles the timer for the normal call path, but a future refactor
+    that invokes `_dispatch_transfer_to_rep` directly (test harness, etc.)
+    must not leave stale transition state.
+    """
+    s = make_session()
+    s.rep_pending = True
+    s.ivr_wait_started_at = time.monotonic()  # arbitrary non-None
+    result = await tools.dispatch(ToolCall(name="transfer_to_rep", args={}), s)
+    assert result.success
+    assert not s.rep_pending
     assert s.ivr_wait_started_at is None
 
 

@@ -399,6 +399,41 @@ async def test_watchdog_resets_on_an_advancing_turn(make_session: MakeSession):
         await runner.stop()
 
 
+async def test_mixed_wait_and_advancing_turn_resets_no_progress(make_session: MakeSession):
+    """A turn with BOTH a `wait` and an advancing tool (e.g., a `send_dtmf`)
+    must reset the no-progress counter via the `elif advanced` branch — the
+    `only_wait` guard is False because not all tool calls are `wait`, but
+    `advanced=True` so the counter resets. Locks the AND-of-two-conditions
+    semantics so a refactor that flips `all()` to `any()` would fail this
+    test.
+    """
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(),  # 1 no-progress (counter=1)
+        IVRTurnResponse(  # mixed: wait + send_dtmf — must reset counter
+            tool_calls=[
+                ToolCall(name="wait", args={}),
+                ToolCall(name="send_dtmf", args={"digits": "1"}),
+            ]
+        ),
+        IVRTurnResponse(  # 1 no-progress again (counter just reset, so 1 not 2)
+            tool_calls=[]
+        ),
+        IVRTurnResponse(  # advancing
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})]
+        ),
+    ]
+    try:
+        await runner.start()
+        for i in range(4):
+            runner.submit_transcript(f"transcript-{i}")
+        await wait_until(lambda: runner.session.done)
+        # Reached complete_call cleanly — no_progress never hit 2.
+        assert runner.session.completion_reason == "user_hangup"
+    finally:
+        await runner.stop()
+
+
 async def test_wait_only_turn_does_not_trip_no_progress_watchdog(
     make_session: MakeSession,
 ):
