@@ -86,7 +86,7 @@ agent/                       # the voice agent
                              #   + Groq IVR client (tool-calling)
                              #   model pins live in this file
   observability.py           # Langfuse @observe wiring + session tagging
-  errors.py                  # AgentError taxonomy (5 typed subclasses)
+  errors.py                  # AgentError taxonomy (typed subclasses)
   schemas.py                 # CallSession, Turn, RepTurnOutput, tool-arg models
   processors/
     state_processor.py       # Pipecat FrameProcessor adapter to CallSession;
@@ -122,7 +122,8 @@ tests/
 - ✅ Two-mode `CallSession` (IVR-with-tools → rep-with-structured-output)
 - ✅ Pipecat audio pipeline with VAD-driven transcript flush + barge-in
 - ✅ Tool dispatcher with per-tool arg validation + Hypothesis property tests
-- ✅ Error taxonomy (`AgentError` + typed subclasses; no string-matching)
+- ✅ Error taxonomy — `AgentError` + typed subclasses, no string-matching
+  on RuntimeError messages (see `agent/errors.py`)
 - ✅ Per-call `benefits.jsonl` deliverable (best-effort, async write)
 - ✅ Langfuse `@observe` tracing across IVR + rep + tool dispatch
 - ✅ End-to-end live-call flow verified on Twilio trial
