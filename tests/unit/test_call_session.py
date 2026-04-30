@@ -399,6 +399,54 @@ async def test_watchdog_resets_on_an_advancing_turn(make_session: MakeSession):
         await runner.stop()
 
 
+async def test_wait_only_turn_does_not_trip_no_progress_watchdog(
+    make_session: MakeSession,
+):
+    """`wait` is a deliberate non-action (acknowledging IVR filler), not a
+    stuck spin. A turn whose only tool was `wait` MUST be exempt from the
+    no-progress watchdog — otherwise the IVR opening sequence ('Welcome
+    to Aetna' + 'Please listen carefully') would terminate the call after
+    just two filler turns. The hold-budget watchdog inside `_dispatch_wait`
+    is the correct guard for "spent too long waiting".
+    """
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    # Three consecutive wait-only turns. Pre-fix, this would trip the
+    # 2-turn no-progress watchdog. Post-fix, the call stays alive and we
+    # finally complete via an explicit complete_call.
+    ivr_llm.responses = [
+        IVRTurnResponse(tool_calls=[ToolCall(name="wait", args={})]),
+        IVRTurnResponse(tool_calls=[ToolCall(name="wait", args={})]),
+        IVRTurnResponse(tool_calls=[ToolCall(name="wait", args={})]),
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})]
+        ),
+    ]
+    try:
+        await runner.start()
+        for i, text in enumerate(
+            ["Welcome to Aetna.", "Please listen carefully.", "Calls may be recorded.", "goodbye"]
+        ):
+            runner.submit_transcript(text)
+            if i < 3:
+                # Give the consumer a chance to process each wait turn so we
+                # observe the watchdog NOT tripping mid-sequence rather than
+                # just at the end.
+                await wait_until(
+                    lambda i=i: runner.session.turn_count > i,
+                    timeout=2.0,
+                    description=f"wait-only turn {i} processed",
+                )
+        await wait_until(lambda: runner.session.done)
+        # Exit reason must be the explicit close, NOT no-progress.
+        assert runner.session.completion_reason == "user_hangup", (
+            f"expected user_hangup, got {runner.session.completion_reason} — "
+            "wait-only turns are tripping the no-progress watchdog"
+        )
+        assert runner.session.ivr_no_progress_turns == 0
+    finally:
+        await runner.stop()
+
+
 # --- Interrupt: queue drains + task.cancel --------------------------------
 
 

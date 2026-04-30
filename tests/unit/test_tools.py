@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import ClassVar
 from unittest.mock import MagicMock
 
@@ -265,6 +266,136 @@ async def test_fail_with_reason_in_rep_mode_completes_as_llm_aborted(make_sessio
     assert s.completion_reason == "llm_aborted_rep"
     assert s.completion_note == "rep refused to disclose"
     assert s.done
+
+
+# --- send_dtmf purpose flag ------------------------------------------------
+
+
+async def test_send_dtmf_purpose_rep_sets_session_flag(make_session: MakeSession):
+    """`purpose='rep'` arms the transition window. Catches a regression where
+    the dispatcher silently ignores the new arg."""
+    s = make_session()
+    assert not s.rep_pending
+    result = await tools.dispatch(
+        ToolCall(name="send_dtmf", args={"digits": "9", "purpose": "rep"}),
+        s,
+    )
+    assert result.success
+    assert result.advanced_call_state
+    assert s.rep_pending
+
+
+async def test_send_dtmf_default_purpose_does_not_set_rep_flag(make_session: MakeSession):
+    """Default `purpose='menu'` (omitted) leaves `rep_pending=False`. Catches
+    a regression where the default flips to `rep` or the field becomes
+    required."""
+    s = make_session()
+    result = await tools.dispatch(ToolCall(name="send_dtmf", args={"digits": "1"}), s)
+    assert result.success
+    assert not s.rep_pending
+
+
+async def test_send_dtmf_purpose_invalid_rejected(make_session: MakeSession):
+    """`purpose` is a closed Literal — anything outside the {menu, rep} set
+    must reject at the schema layer (no silent coercion)."""
+    s = make_session()
+    result = await tools.dispatch(
+        ToolCall(name="send_dtmf", args={"digits": "9", "purpose": "agent"}),
+        s,
+    )
+    assert not result.success
+    assert "invalid args" in result.message
+    assert not s.rep_pending
+
+
+# --- wait tool: outside the transition window -----------------------------
+
+
+async def test_wait_outside_transition_is_free(make_session: MakeSession):
+    """Before any rep digit is pressed, `wait` is free — no timer, no
+    state mutation. Models the IVR opening greeting case ('Welcome to
+    Aetna') where there's no menu yet to act on."""
+    s = make_session()
+    result = await tools.dispatch(ToolCall(name="wait", args={}), s)
+    assert result.success
+    assert not result.advanced_call_state
+    assert s.ivr_wait_started_at is None
+    assert s.completion_reason is None
+
+
+async def test_wait_after_transfer_is_free(make_session: MakeSession):
+    """After `transfer_to_rep` clears `rep_pending`, subsequent waits are
+    untimed. (Rep mode shouldn't emit `wait` in practice, but the
+    dispatcher path must not arm a stale hold timer.)"""
+    s = make_session()
+    s.rep_pending = True
+    await tools.dispatch(ToolCall(name="transfer_to_rep", args={}), s)
+    assert not s.rep_pending  # transfer cleared the flag
+    result = await tools.dispatch(ToolCall(name="wait", args={}), s)
+    assert result.success
+    assert s.ivr_wait_started_at is None
+
+
+# --- wait tool: inside the transition window -----------------------------
+
+
+async def test_wait_inside_transition_arms_timer(make_session: MakeSession):
+    """First `wait` after `purpose='rep'` was pressed sets the clock."""
+    s = make_session()
+    await tools.dispatch(
+        ToolCall(name="send_dtmf", args={"digits": "9", "purpose": "rep"}),
+        s,
+    )
+    assert s.rep_pending
+    assert s.ivr_wait_started_at is None  # rep_pending set, but no wait yet
+    result = await tools.dispatch(ToolCall(name="wait", args={}), s)
+    assert result.success
+    assert s.ivr_wait_started_at is not None
+    assert s.completion_reason is None
+
+
+async def test_wait_inside_transition_under_budget_does_not_terminate(
+    make_session: MakeSession,
+):
+    """Subsequent `wait` calls within budget keep the call alive."""
+    s = make_session()
+    s.rep_pending = True
+    s.ivr_wait_started_at = time.monotonic() - 60.0  # 1 min into hold
+    result = await tools.dispatch(ToolCall(name="wait", args={}), s)
+    assert result.success
+    assert s.completion_reason is None
+
+
+async def test_wait_inside_transition_past_budget_terminates(make_session: MakeSession):
+    """After 15 min of hold, the call terminates with `ivr_hold_timeout`."""
+    s = make_session()
+    s.rep_pending = True
+    # Set the timer to 16 min ago (past the 15-min budget).
+    s.ivr_wait_started_at = time.monotonic() - (16 * 60)
+    result = await tools.dispatch(ToolCall(name="wait", args={}), s)
+    assert result.success
+    assert s.completion_reason == "ivr_hold_timeout"
+    assert s.done
+    assert isinstance(result.side_effect, HangupIntent)
+
+
+async def test_advancing_tool_resets_hold_timer(make_session: MakeSession):
+    """Any non-`wait` dispatch clears `ivr_wait_started_at`. Models the
+    case where the IVR sends a NEW menu mid-hold — pressing in response
+    breaks the hold and re-entering wait gets a fresh budget."""
+    s = make_session()
+    s.rep_pending = True
+    s.ivr_wait_started_at = time.monotonic() - 10.0  # 10s into hold
+
+    # Pressing a digit (any tool other than wait) clears the timer.
+    s.recent_menu_options = ["1"]
+    await tools.dispatch(ToolCall(name="send_dtmf", args={"digits": "1"}), s)
+    assert s.ivr_wait_started_at is None
+
+    # Re-entering wait state (rep_pending still True) gets a fresh start.
+    result = await tools.dispatch(ToolCall(name="wait", args={}), s)
+    assert result.success
+    assert s.ivr_wait_started_at is not None  # freshly armed
 
 
 # --- agent/telephony/dtmf.py -----------------------------------------------
