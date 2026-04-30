@@ -44,9 +44,10 @@ QUEUE_MAX = 8
 
 _LOG_PREVIEW_CHARS = 300
 """Cap on free-form text fields in structured logs (transcripts, LLM
-replies, tool-result messages). The full text lives in Langfuse traces
-when enabled; this keeps stdout-tailing usable without losing the
-diagnostic shape."""
+replies, tool-result messages). When Langfuse is recording, the full
+text is also captured there; when it isn't, the truncated stdout log
+is the only record. 300 chars is enough to read the gist of a typical
+IVR menu or rep utterance without blowing up log lines."""
 
 _DEFAULT_BENEFITS_LOG_PATH = "benefits.jsonl"
 """Default location for the per-call benefits JSONL. Overridable via the

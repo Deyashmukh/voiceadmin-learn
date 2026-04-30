@@ -5,11 +5,16 @@ Langfuse reads credentials from env vars:
   - LANGFUSE_PUBLIC_KEY
   - LANGFUSE_SECRET_KEY
   - LANGFUSE_HOST (defaults to the cloud host if unset)
+  - LANGFUSE_DISABLED (set to "true" / "1" / "yes" to opt out even when
+    keys are present — useful for running offline without a local
+    backend)
 
-When Langfuse is unavailable (env missing or backend unreachable), every
-helper here is a quiet no-op — the agent runs without traces but doesn't
-fail. `@observe` decorators elsewhere are likewise no-ops without keys
-(the SDK's `get_client()` returns a stub).
+When Langfuse is disabled, every helper here is a quiet no-op and
+`@observe` decorators reduce to a passthrough (`_passthrough_decorator`).
+This isn't just helpful — it's load-bearing: even with valid keys, if
+the backend is unreachable the OTel batch processor records spans every
+call and spams connection-refused errors trying to ship them. The
+explicit gate prevents that path entirely.
 
 Known UI quirk: Langfuse's `@observe` records `asyncio.CancelledError` as
 an ERROR-level span. Barge-ins show up as red error traces in the UI even
@@ -94,7 +99,7 @@ def _langfuse_enabled() -> bool:
 _LANGFUSE_ENABLED = _langfuse_enabled()
 
 
-def _passthrough_decorator[F: Callable[..., Any]](fn: F) -> F:
+def _passthrough_decorator(fn: F) -> F:  # noqa: UP047 — keep consistent with observe()'s module-level F
     """No-op decorator returned by `observe()` when Langfuse is disabled.
     Module-level so it isn't reallocated on every decoration."""
     return fn

@@ -271,3 +271,15 @@ def test_observe_invokes_langfuse_when_enabled(monkeypatch: pytest.MonkeyPatch):
 
     assert result is sentinel_decorator
     fake_langfuse_observe.assert_called_once_with(name="test_span", as_type="span")
+
+
+def test_module_level_langfuse_enabled_matches_function_at_import():
+    """`_LANGFUSE_ENABLED` is the cached module constant the gate uses;
+    `_langfuse_enabled()` is the function that computes it. Lock the
+    wiring: `_LANGFUSE_ENABLED` must equal what `_langfuse_enabled()`
+    would return under the import-time env. Catches a refactor that
+    accidentally re-points the constant at a different function or
+    inlines a stale value (the function-level tests above can't see
+    such a regression because they re-evaluate the function directly).
+    """
+    assert observability._langfuse_enabled() == observability._LANGFUSE_ENABLED  # pyright: ignore[reportPrivateUsage]
