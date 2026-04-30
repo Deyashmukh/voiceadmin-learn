@@ -181,14 +181,17 @@ class GroqToolCallingClient:
             # confused LLM. Every retry would fail the same way.
             raise
         except APIError as exc:
-            # Everything else from the Groq SDK is either input-rejection
-            # (`tool_use_failed`, schema mismatch) or a transient provider
-            # condition (429, 5xx, connection blip, timeout). None of these
-            # should kill the consumer mid-call: empty response counts as a
-            # no-progress turn, and two in a row trips the watchdog.
-            # Non-`APIError` exceptions (programmer bugs, schema drift)
-            # propagate intentionally so they surface in CI / Langfuse
-            # rather than looking like LLM weirdness.
+            # Everything else from the Groq SDK is either input-rejection or
+            # transient provider pressure (4xx tool_use_failed, 429, 5xx,
+            # connection blip, timeout). None should kill the consumer mid-
+            # call: empty response counts as a no-progress turn, two in a
+            # row trips the watchdog. The non-obvious one: `BadRequestError`
+            # is on this side, not the misconfig side, because Groq returns
+            # it for `tool_use_failed` when the LLM's output is
+            # unclassifiable for the input — looks like a 400 but is
+            # transient model behavior, not a config error. Non-`APIError`
+            # exceptions (programmer bugs, schema drift) propagate so they
+            # surface in CI / Langfuse instead of looking like LLM weirdness.
             log.warning(
                 "ivr_llm_call_failed",
                 error_class=type(exc).__name__,

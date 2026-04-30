@@ -117,7 +117,10 @@ async def test_call_completion_appends_jsonl_record(make_session: MakeSession):
         # flip) — JSONL write happens AFTER `session.done` is set, via
         # `asyncio.to_thread`, and the consumer only exits once the write
         # returns. Cancelling mid-write would leave the file unwritten.
-        await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+        await wait_until(
+            lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
+            description="consumer task done (post-write)",
+        )
     finally:
         await runner.stop()
     log_path = Path(os.environ["BENEFITS_LOG_PATH"])
@@ -151,7 +154,10 @@ async def test_jsonl_append_does_not_overwrite_prior_calls(make_session: MakeSes
             runner.submit_transcript("Thank you, goodbye.")
             # Wait for the consumer to actually finish — see the equivalent
             # comment in test_call_completion_appends_jsonl_record.
-            await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+            await wait_until(
+                lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
+                description="consumer task done (post-write)",
+            )
         finally:
             await runner.stop()
 
@@ -187,7 +193,10 @@ async def test_jsonl_write_failure_does_not_abort_call(
         try:
             await runner.start()
             runner.submit_transcript("Thank you, goodbye.")
-            await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+            await wait_until(
+                lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
+                description="consumer task done (post-write)",
+            )
         finally:
             await runner.stop()
     assert runner.session.completion_reason == "benefits_extracted"
@@ -233,7 +242,10 @@ async def test_jsonl_serialize_failure_logs_and_skips_write(
         try:
             await runner.start()
             runner.submit_transcript("Thank you, goodbye.")
-            await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+            await wait_until(
+                lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
+                description="consumer task done (post-write)",
+            )
         finally:
             await runner.stop()
     assert runner.session.completion_reason == "benefits_extracted"
@@ -532,7 +544,10 @@ async def test_consumer_exits_after_complete_call_without_extra_transcript(
     runner.submit_transcript("Done with menu")
     # Wait for both: session.done AND consumer task itself completes.
     await wait_until(lambda: runner.session.done)
-    await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+    await wait_until(
+        lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
+        description="consumer task done (post-write)",
+    )
     assert runner.session.completion_reason == "benefits_extracted"
     # Consumer is done — stop() should be a no-op for the consumer task.
     await runner.stop()
@@ -561,7 +576,10 @@ async def test_consumer_death_sets_completion_reason(make_session: MakeSession):
     try:
         await runner.start()
         runner.submit_transcript("kickoff")
-        await wait_until(lambda: runner._consumer is not None and runner._consumer.done())  # pyright: ignore[reportPrivateUsage]
+        await wait_until(
+            lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
+            description="consumer task done (post-write)",
+        )
         assert runner.session.completion_reason == "consumer_died"
     finally:
         await runner.stop()
