@@ -433,6 +433,7 @@ async def test_pump_gives_up_after_consecutive_failures_and_keeps_draining(
             await wait_until(
                 lambda: runner.session.completion_reason == "pipeline_torn_down",
                 timeout=2.0,
+                description="pump set completion_reason='pipeline_torn_down'",
             )
             # Pump must still be alive — returning would deadlock the runner.
             assert proc._pump_task is not None and not proc._pump_task.done(), (  # pyright: ignore[reportPrivateUsage]
@@ -440,7 +441,11 @@ async def test_pump_gives_up_after_consecutive_failures_and_keeps_draining(
             )
             # Post-give-up enqueue must drain (the deadlock-avoidance contract).
             await runner.out_queue.put("post-give-up")
-            await wait_until(lambda: runner.out_queue.empty(), timeout=2.0)
+            await wait_until(
+                lambda: runner.out_queue.empty(),
+                timeout=2.0,
+                description="pump drained out_queue after give-up",
+            )
             # `pump_giving_up` log fires exactly once (filter event+level so a
             # rename or severity-downgrade fails the test).
             give_up_events = [

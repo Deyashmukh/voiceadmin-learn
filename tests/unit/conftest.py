@@ -73,7 +73,12 @@ class IVRCall(NamedTuple):
     tools: list[dict[str, object]]
 
 
-async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
+async def wait_until(
+    predicate: Callable[[], bool],
+    timeout: float = 1.0,
+    *,
+    description: str | None = None,
+) -> None:
     """Yield to the event loop until `predicate()` returns truthy, or fail
     after a bounded number of iterations.
 
@@ -86,6 +91,10 @@ async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> Non
     flip. Caveat: under sustained event-loop blocking (e.g. a long synchronous
     call that never yields), iterations stall just as the old wall-clock
     version did. The change buys variance-immunity, not blocking-immunity.
+
+    `description` is for the timeout AssertionError message — caller-supplied
+    text describes what we were waiting for, since `predicate.__name__` is
+    `<lambda>` for almost every site and useless under CI flake triage.
     """
     # 1 ms per iteration → `timeout` seconds maps to `timeout * 1000` iterations.
     # Floor at 1 to keep `timeout=0` from short-circuiting the first check.
@@ -94,7 +103,8 @@ async def wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> Non
         if predicate():
             return
         await asyncio.sleep(0.001)
-    raise AssertionError(f"timed out waiting on {predicate.__name__}")
+    label = description or predicate.__name__
+    raise AssertionError(f"timed out waiting on {label}")
 
 
 @dataclass

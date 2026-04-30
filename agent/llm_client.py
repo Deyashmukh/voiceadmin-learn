@@ -181,11 +181,18 @@ class GroqToolCallingClient:
             # confused LLM. Every retry would fail the same way.
             raise
         except APIError as exc:
-            # Everything else from the Groq SDK is either input-rejection
-            # (`tool_use_failed`, schema mismatch) or a transient provider
-            # condition (429, 5xx, connection blip, timeout). None of these
-            # should kill the consumer mid-call: empty response counts as a
-            # no-progress turn, and two in a row trips the watchdog.
+            # Everything else from the Groq SDK is either input-rejection or
+            # a transient provider condition. None of these should kill the
+            # consumer mid-call: empty response counts as a no-progress turn,
+            # and two in a row trips the watchdog. Specifically:
+            #   - BadRequestError: Groq returns this for `tool_use_failed`
+            #     when the LLM's output is un-classifiable for the input.
+            #     Looks like a 400 but is a transient model behavior, not a
+            #     misconfig — retrying on the next turn often succeeds.
+            #   - UnprocessableEntityError: similar input-rejection shape.
+            #   - RateLimitError / InternalServerError: transient provider
+            #     pressure. A single 429 must NOT kill a live call.
+            #   - APIConnectionError / APITimeoutError: network blip.
             # Non-`APIError` exceptions (programmer bugs, schema drift)
             # propagate intentionally so they surface in CI / Langfuse
             # rather than looking like LLM weirdness.
