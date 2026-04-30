@@ -115,6 +115,17 @@ IVR_NO_PROGRESS_LIMIT = 2
 # After 2 consecutive rep turns where the LLM emits phase="stuck", terminate.
 REP_STUCK_LIMIT = 2
 
+REP_LLM_TIMEOUT_S = 8.0
+"""Wall-clock budget for a single rep LLM round-trip. Claude Haiku typically
+returns in 1-2s; setting this at 8s leaves p99 headroom while still cutting
+off anomalous stalls (live testing observed a 16s outlier on one turn,
+which surfaced as 17s of silence + a flood of stacked replies when other
+transcripts queued up behind it). On timeout the runner speaks a brief
+filler so the user knows the agent is still alive, and skips merging
+benefits for that turn — the user can volunteer the value again."""
+
+_TIMEOUT_FILLER_REPLY = "One moment, let me check that."
+
 
 class IVRLLMClient(Protocol):
     """Tool-calling LLM for IVR mode. Production: `GroqToolCallingClient`.
@@ -366,11 +377,37 @@ class CallSessionRunner:
         # rather than `or 0` because index 0 is a legitimate value (flip at
         # an empty history) that `or` would silently collapse.
         start = 0 if self.session.rep_mode_index is None else self.session.rep_mode_index
-        output = await self.rep_llm.complete_structured(
-            system=self.rep_system_prompt,
-            history=_history_to_anthropic_messages(self.session.history[start:]),
-            schema=RepTurnOutput,
-        )
+        try:
+            output = await asyncio.wait_for(
+                self.rep_llm.complete_structured(
+                    system=self.rep_system_prompt,
+                    history=_history_to_anthropic_messages(self.session.history[start:]),
+                    schema=RepTurnOutput,
+                ),
+                timeout=REP_LLM_TIMEOUT_S,
+            )
+        except TimeoutError:
+            # Anomalous stall (Anthropic transient slowness, internal retry
+            # backoff, network blip). Speak a brief filler so the user
+            # doesn't sit in dead silence, append a placeholder assistant
+            # turn so the next call has narrative continuity, and return
+            # without touching benefits or stuck_turns. The user can
+            # volunteer the same value again on the next turn.
+            log.warning(
+                "rep_llm_timeout",
+                timeout_s=REP_LLM_TIMEOUT_S,
+                history_len=len(self.session.history),
+            )
+            # Race guard: if a barge-in fires between TimeoutError and the
+            # filler dispatch, `mark_interrupted` will have set
+            # `_interrupt_requested` (and drained out_queue). Skip speaking
+            # — pushing the filler into a freshly-drained queue would
+            # defeat the barge-in.
+            if self._interrupt_requested:
+                return
+            await self.actuator.execute(SpeakIntent(text=_TIMEOUT_FILLER_REPLY))
+            self.session.history.append(Turn(role="assistant", content=_TIMEOUT_FILLER_REPLY))
+            return
         log.info(
             "rep_response_received",
             reply=output.reply[:_LOG_PREVIEW_CHARS] if output.reply else "",
