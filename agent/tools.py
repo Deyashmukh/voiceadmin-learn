@@ -51,8 +51,12 @@ TOOL_ARG_MODELS: dict[ToolName, type[BaseModel]] = {
 _TOOL_DESCRIPTIONS: dict[ToolName, str] = {
     "send_dtmf": ("Press DTMF tones on the live phone call. Use to navigate IVR menus."),
     "speak": (
-        "Speak a short text aloud over TTS. Use sparingly in IVR mode "
-        "(e.g., 'one moment' before a slow DTMF)."
+        "Speak the LITERAL text aloud over TTS. In IVR mode this is ONLY "
+        "for providing the patient's identifiers (name, member ID, DOB) "
+        "when the IVR explicitly prompts for them, OR for the spoken "
+        "repeat command an IVR menu offered (e.g., 'repeat'). NEVER use "
+        "to greet, converse, narrate, or acknowledge — the IVR doesn't "
+        "respond to chit-chat and it wastes turns."
     ),
     "record_benefit": (
         "Record a benefit field value the IVR (or rep) read aloud. "
