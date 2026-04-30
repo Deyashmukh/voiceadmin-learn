@@ -42,10 +42,12 @@ ignore = ["E501"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
-# Strictness is opted into per-file via `# pyright: strict` headers (see
-# CLAUDE.md M8'/A). Per-file flips force each module to declare its strict
-# stance explicitly, so strict-only diagnostics surface in review rather
-# than being silently inherited from a package-level config.
+# Strictness is opted into per-file via `# pyright: strict` headers. Per-file
+# flips force each module to declare its strict stance explicitly, so
+# strict-only diagnostics surface in review rather than being silently
+# inherited from a package-level config. New files in `agent/` and `tests/`
+# MUST include the header — without it they fall back to `typeCheckingMode`
+# above and skip strict diagnostics.
 include = ["agent", "tests"]
 exclude = [".venv", "**/__pycache__"]
 
