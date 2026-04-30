@@ -802,6 +802,118 @@ async def test_rep_turn_speaks_reply_and_merges_partial_benefits(make_session: M
         await runner.stop()
 
 
+async def test_rep_turn_timeout_speaks_filler_and_continues(
+    make_session: MakeSession, monkeypatch: pytest.MonkeyPatch
+):
+    """If the rep LLM stalls past `REP_LLM_TIMEOUT_S`, the runner must NOT
+    sit in dead silence — it speaks a brief filler and continues.
+
+    Live testing observed a 16s anomalous Anthropic stall that produced
+    17s of silence + 3 stacked replies once the call returned. The timeout
+    + filler reply caps the silent gap at ~8s and gives the user verbal
+    feedback that the agent is alive.
+
+    Patches `REP_LLM_TIMEOUT_S` to 0.05s so the test runs in well under a
+    second. `slow_mode_seconds=10` on the fake means the underlying
+    `asyncio.sleep` is cancelled when wait_for trips — no real 10s wait.
+    """
+    from agent.call_session import _TIMEOUT_FILLER_REPLY  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr("agent.call_session.REP_LLM_TIMEOUT_S", 0.05)
+    actuator = FakeActuator()
+    rep_llm = FakeAnthropicRepClient(slow_mode_seconds=10.0, responses=[])
+    runner = CallSessionRunner(
+        session=make_session(mode="rep"),
+        ivr_llm=FakeIVRLLMClient(),
+        rep_llm=rep_llm,
+        tool_dispatcher=tools.dispatch,
+        ivr_system_prompt="ivr",
+        rep_system_prompt="rep",
+        tools=[],
+        actuator=actuator,
+    )
+    try:
+        await runner.start()
+        runner.submit_transcript("Hi, are you there?")
+        await wait_until(
+            lambda: any(
+                isinstance(i, SpeakIntent) and i.text == _TIMEOUT_FILLER_REPLY
+                for i in actuator.executed
+            ),
+            timeout=2.0,
+            description="filler reply spoken after rep timeout",
+        )
+        speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
+        assert len(speaks) == 1
+        # Exact constant comparison — substring would silently still pass on a
+        # bad rephrase like "Just a moment longer, sorry for the trouble".
+        assert speaks[0].text == _TIMEOUT_FILLER_REPLY
+        # No benefits extracted from a timed-out turn.
+        assert runner.session.benefits.model_dump(exclude_none=True) == {}
+        # Stuck counter NOT incremented — timeout ≠ phase=stuck.
+        assert runner.session.stuck_turns == 0
+        # Call is still alive (no completion_reason set).
+        assert runner.session.completion_reason is None
+    finally:
+        await runner.stop()
+
+
+async def test_rep_turn_timeout_skips_filler_when_interrupt_pending(
+    make_session: MakeSession, monkeypatch: pytest.MonkeyPatch
+):
+    """If a barge-in fires between TimeoutError and the filler dispatch,
+    `mark_interrupted` sets `_interrupt_requested` and drains out_queue.
+    The filler MUST NOT be spoken in that race window — pushing it into
+    a freshly-drained queue would defeat the barge-in. Locks the guard
+    added at agent/call_session.py for this race.
+    """
+    monkeypatch.setattr("agent.call_session.REP_LLM_TIMEOUT_S", 0.05)
+    actuator = FakeActuator()
+    rep_llm = FakeAnthropicRepClient(slow_mode_seconds=10.0, responses=[])
+    runner = CallSessionRunner(
+        session=make_session(mode="rep"),
+        ivr_llm=FakeIVRLLMClient(),
+        rep_llm=rep_llm,
+        tool_dispatcher=tools.dispatch,
+        ivr_system_prompt="ivr",
+        rep_system_prompt="rep",
+        tools=[],
+        actuator=actuator,
+    )
+    try:
+        await runner.start()
+        runner.submit_transcript("Hi, are you there?")
+        # Pre-set models the worst case where mark_interrupted ran but the
+        # cancel hasn't yet hit a yield point.
+        await wait_until(
+            lambda: runner._current_turn is not None,  # pyright: ignore[reportPrivateUsage]
+            timeout=1.0,
+            description="turn task created",
+        )
+        runner._interrupt_requested = True  # pyright: ignore[reportPrivateUsage]
+        # Wait for the consumer to finish the timed-out turn (it will hit
+        # TimeoutError, see _interrupt_requested, and return early without
+        # appending a filler placeholder).
+        await wait_until(
+            lambda: runner.session.turn_count > 0,
+            timeout=2.0,
+            description="rep turn completed (turn_count incremented)",
+        )
+        # No filler was spoken — the race guard caught it.
+        speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
+        assert len(speaks) == 0, (
+            f"expected NO filler when interrupt pending; got {[s.text for s in speaks]}"
+        )
+        # The guard MUST consume the flag — otherwise a future turn's guard
+        # would mis-fire on a stale flag (we returned early without going
+        # through the consumer's CancelledError-handling reset path).
+        assert runner._interrupt_requested is False, (  # pyright: ignore[reportPrivateUsage]
+            "guard left flag stale; future turns would skip fillers incorrectly"
+        )
+    finally:
+        await runner.stop()
+
+
 async def test_rep_turn_complete_phase_ends_call(make_session: MakeSession):
     runner, _, rep_llm = _build_runner(make_session(mode="rep"), actuator=FakeActuator())
     rep_llm.responses = [
