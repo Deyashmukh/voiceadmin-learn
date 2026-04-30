@@ -5,11 +5,16 @@ Langfuse reads credentials from env vars:
   - LANGFUSE_PUBLIC_KEY
   - LANGFUSE_SECRET_KEY
   - LANGFUSE_HOST (defaults to the cloud host if unset)
+  - LANGFUSE_DISABLED (set to "true" / "1" / "yes" to opt out even when
+    keys are present — useful for running offline without a local
+    backend)
 
-When Langfuse is unavailable (env missing or backend unreachable), every
-helper here is a quiet no-op — the agent runs without traces but doesn't
-fail. `@observe` decorators elsewhere are likewise no-ops without keys
-(the SDK's `get_client()` returns a stub).
+When Langfuse is disabled, every helper here is a quiet no-op and
+`@observe` decorators reduce to a passthrough (`_passthrough_decorator`).
+This isn't just helpful — it's load-bearing: even with valid keys, if
+the backend is unreachable the OTel batch processor records spans every
+call and spams connection-refused errors trying to ship them. The
+explicit gate prevents that path entirely.
 
 Known UI quirk: Langfuse's `@observe` records `asyncio.CancelledError` as
 an ERROR-level span. Barge-ins show up as red error traces in the UI even
@@ -62,14 +67,42 @@ def observe(*, name: str | None = None, as_type: ObservationType | None = None) 
     function's signature. `as_type` is passed through to langfuse at runtime
     but does NOT propagate into the wrapped function's type — reflecting the
     SDK's overload set here would re-introduce the stub gap this wrapper
-    exists to contain."""
+    exists to contain.
+
+    When Langfuse is disabled, returns a passthrough decorator instead of
+    invoking `langfuse.observe`. Without this, the OTel batch span
+    processor would still record spans on every call and try to ship them
+    to an unreachable backend, spamming the logs.
+    """
+    if not _LANGFUSE_ENABLED:
+        return _passthrough_decorator
     return _langfuse_observe(name=name, as_type=as_type)  # pyright: ignore[reportUnknownVariableType]
 
 
 FLUSH_TIMEOUT_S = 2.0
+
+
+def _langfuse_enabled() -> bool:
+    """True when both Langfuse keys are present AND `LANGFUSE_DISABLED`
+    is not set to a truthy value. The opt-out exists so a developer can
+    run without a local Langfuse backend without the OTel exporter
+    spamming `localhost:3000` connection-refused errors during every
+    call.
+    """
+    if os.getenv("LANGFUSE_DISABLED", "").lower() in {"1", "true", "yes"}:
+        return False
+    return bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
+
+
 # Captured once at import: dotenv has already loaded by the time agent.main
-# imports this module, and the keys don't rotate within a process.
-_LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))
+# imports this module, and the env doesn't rotate within a process.
+_LANGFUSE_ENABLED = _langfuse_enabled()
+
+
+def _passthrough_decorator(fn: F) -> F:  # noqa: UP047 — keep consistent with observe()'s module-level F
+    """No-op decorator returned by `observe()` when Langfuse is disabled.
+    Module-level so it isn't reallocated on every decoration."""
+    return fn
 
 
 async def flush_langfuse() -> None:

@@ -181,3 +181,105 @@ def test_observability_uses_function_local_imports():
     pass vacuously. Catch that here."""
     assert not hasattr(observability, "get_client")
     assert not hasattr(observability, "propagate_attributes")
+
+
+# --- LANGFUSE_DISABLED opt-out --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("disabled_value", "expected"),
+    [
+        ("true", False),
+        ("True", False),
+        ("1", False),
+        ("yes", False),
+        ("YES", False),
+        ("false", True),
+        ("0", True),
+        ("", True),
+        ("anything-else", True),
+    ],
+    ids=[
+        "true",
+        "True-mixed-case",
+        "1",
+        "yes",
+        "YES-uppercase",
+        "false",
+        "0",
+        "empty",
+        "garbage",
+    ],
+)
+def test_langfuse_enabled_honors_disabled_opt_out(
+    monkeypatch: pytest.MonkeyPatch, disabled_value: str, expected: bool
+):
+    """`LANGFUSE_DISABLED` is the explicit opt-out — even with valid keys
+    set, a truthy value short-circuits to disabled. Locks the case-
+    insensitive accept set and confirms only the documented values count."""
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_DISABLED", disabled_value)
+    assert observability._langfuse_enabled() is expected  # pyright: ignore[reportPrivateUsage]
+
+
+def test_langfuse_enabled_requires_both_keys(monkeypatch: pytest.MonkeyPatch):
+    """Without keys present, opt-out value is irrelevant — disabled either
+    way. Locks the AND-gate over keys (silly mistake to OR them)."""
+    monkeypatch.delenv("LANGFUSE_DISABLED", raising=False)
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    assert observability._langfuse_enabled() is False  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    assert observability._langfuse_enabled() is False  # pyright: ignore[reportPrivateUsage]
+
+
+def test_observe_returns_passthrough_when_disabled(monkeypatch: pytest.MonkeyPatch):
+    """When Langfuse is disabled, `observe()` must return a passthrough
+    decorator — NOT call into `langfuse.observe`. Without this short-
+    circuit, the OTel batch span processor still records spans on every
+    call and tries to ship them, spamming logs when the backend is down.
+
+    Asserts both: (a) the decorator preserves the wrapped function (same
+    object identity on apply), and (b) `langfuse.observe` is never invoked.
+    """
+    monkeypatch.setattr(observability, "_LANGFUSE_ENABLED", False)
+    fake_langfuse_observe = MagicMock()
+    monkeypatch.setattr(observability, "_langfuse_observe", fake_langfuse_observe)
+
+    decorator = observability.observe(name="test_span", as_type="span")
+
+    def wrapped() -> int:
+        return 42
+
+    decorated = decorator(wrapped)
+    assert decorated is wrapped, "passthrough must return the same function unchanged"
+    assert decorated() == 42
+    fake_langfuse_observe.assert_not_called()
+
+
+def test_observe_invokes_langfuse_when_enabled(monkeypatch: pytest.MonkeyPatch):
+    """Symmetric counterpart: when enabled, `observe()` delegates to
+    `langfuse.observe`. Catches a regression that flips the gate inverted."""
+    monkeypatch.setattr(observability, "_LANGFUSE_ENABLED", True)
+    sentinel_decorator = MagicMock(name="sentinel_decorator")
+    fake_langfuse_observe = MagicMock(return_value=sentinel_decorator)
+    monkeypatch.setattr(observability, "_langfuse_observe", fake_langfuse_observe)
+
+    result = observability.observe(name="test_span", as_type="span")
+
+    assert result is sentinel_decorator
+    fake_langfuse_observe.assert_called_once_with(name="test_span", as_type="span")
+
+
+def test_module_level_langfuse_enabled_matches_function_at_import():
+    """`_LANGFUSE_ENABLED` is the cached module constant the gate uses;
+    `_langfuse_enabled()` is the function that computes it. Lock the
+    wiring: `_LANGFUSE_ENABLED` must equal what `_langfuse_enabled()`
+    would return under the import-time env. Catches a refactor that
+    accidentally re-points the constant at a different function or
+    inlines a stale value (the function-level tests above can't see
+    such a regression because they re-evaluate the function directly).
+    """
+    assert observability._langfuse_enabled() == observability._LANGFUSE_ENABLED  # pyright: ignore[reportPrivateUsage]

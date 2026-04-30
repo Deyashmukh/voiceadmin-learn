@@ -42,6 +42,13 @@ from agent.schemas import (
 
 QUEUE_MAX = 8
 
+_LOG_PREVIEW_CHARS = 300
+"""Cap on free-form text fields in structured logs (transcripts, LLM
+replies, tool-result messages). When Langfuse is recording, the full
+text is also captured there; when it isn't, the truncated stdout log
+is the only record. 300 chars is enough to read the gist of a typical
+IVR menu or rep utterance without blowing up log lines."""
+
 _DEFAULT_BENEFITS_LOG_PATH = "benefits.jsonl"
 """Default location for the per-call benefits JSONL. Overridable via the
 `BENEFITS_LOG_PATH` env var (read on each call so tests can redirect to a
@@ -188,6 +195,7 @@ class CallSessionRunner:
         loudly when it happens so a "the agent silently skipped a menu"
         symptom is greppable.
         """
+        log.info("transcript_submitted", mode=self.session.mode, text=text[:_LOG_PREVIEW_CHARS])
         try:
             self.in_queue.put_nowait(text)
         except asyncio.QueueFull:
@@ -293,6 +301,12 @@ class CallSessionRunner:
             tools=self.tools,
             temperature=0.1,
         )
+        log.info(
+            "ivr_response_received",
+            tool_call_count=len(response.tool_calls),
+            tool_calls=[{"name": c.name, "args": c.args} for c in response.tool_calls],
+            text=response.text[:_LOG_PREVIEW_CHARS] if response.text else "",
+        )
         advanced = False
         for call in response.tool_calls:
             # Pair each tool_call with a tool_result entry — even on cancellation
@@ -310,6 +324,14 @@ class CallSessionRunner:
                     )
                 )
                 raise
+            log.info(
+                "ivr_tool_dispatched",
+                name=call.name,
+                args=call.args,
+                success=result.success,
+                advanced=result.advanced_call_state,
+                message=result.message[:_LOG_PREVIEW_CHARS] if result.message else "",
+            )
             self.session.history.append(
                 Turn(role="tool_result", tool_result=result, content=result.message)
             )
@@ -342,6 +364,12 @@ class CallSessionRunner:
             system=self.rep_system_prompt,
             history=_history_to_anthropic_messages(self.session.history[start:]),
             schema=RepTurnOutput,
+        )
+        log.info(
+            "rep_response_received",
+            reply=output.reply[:_LOG_PREVIEW_CHARS] if output.reply else "",
+            extracted=output.extracted.model_dump(exclude_none=True),
+            phase=output.phase,
         )
         # Non-None merge into session.benefits — the LLM emits only the fields
         # learned from THIS rep utterance; previously-extracted fields stay.
