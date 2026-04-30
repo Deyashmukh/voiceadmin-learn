@@ -342,12 +342,18 @@ class CallSessionRunner:
                     raise
             if result.advanced_call_state:
                 advanced = True
-        if not advanced:
+        # `wait` is a deliberate non-action (acknowledging filler/hold/greeting)
+        # — it must NOT trip the no-progress watchdog the way a stuck-on-
+        # validator-rejection LLM would. The hold-budget watchdog inside
+        # `_dispatch_wait` is the correct guard for "spent too long waiting".
+        # A turn whose only tool calls were `wait` is exempt here.
+        only_wait = bool(response.tool_calls) and all(c.name == "wait" for c in response.tool_calls)
+        if not advanced and not only_wait:
             self.session.ivr_no_progress_turns += 1
             if self.session.ivr_no_progress_turns >= IVR_NO_PROGRESS_LIMIT:
                 self.session.completion_reason = "ivr_no_progress"
                 log.info("ivr_no_progress_watchdog_tripped")
-        else:
+        elif advanced:
             self.session.ivr_no_progress_turns = 0
 
     @observe(name="rep_turn")

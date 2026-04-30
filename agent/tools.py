@@ -14,8 +14,11 @@ from a rejection round-trip.
 
 from __future__ import annotations
 
+import time
+
 from pydantic import BaseModel, ValidationError
 
+from agent.logging_config import log
 from agent.observability import observe, set_current_span_name
 from agent.schemas import (
     BenefitField,
@@ -32,6 +35,7 @@ from agent.schemas import (
     ToolName,
     ToolResult,
     TransferToRepArgs,
+    WaitArgs,
 )
 
 # Per-tool argument schemas. Adding a new tool is a one-line registry update +
@@ -43,6 +47,7 @@ TOOL_ARG_MODELS: dict[ToolName, type[BaseModel]] = {
     "transfer_to_rep": TransferToRepArgs,
     "complete_call": CompleteCallArgs,
     "fail_with_reason": FailWithReasonArgs,
+    "wait": WaitArgs,
 }
 
 # Descriptions surfaced to the IVR LLM via the Groq tool schema. Each one
@@ -73,6 +78,16 @@ _TOOL_DESCRIPTIONS: dict[ToolName, str] = {
     "fail_with_reason": (
         "Abort the call with a free-form reason. Use only when no tool fits "
         "and the call cannot continue."
+    ),
+    "wait": (
+        "Acknowledge the current utterance without acting. Use for IVR "
+        "opening greetings ('Welcome to Aetna' BEFORE any menu has appeared "
+        "— this is the IVR itself, not a rep), hold music, hold announcements "
+        "('please continue to hold'), filler ('calls may be recorded'), and "
+        "any non-actionable input. After `send_dtmf(purpose='rep')`, repeated "
+        "`wait` calls are bounded by a 15-min hold budget. Before any rep "
+        "digit is pressed, NEVER use `transfer_to_rep` for greetings — they "
+        "are the IVR opening, not a rep arriving."
     ),
 }
 
@@ -111,6 +126,14 @@ _BENEFIT_FIELD_TYPES: dict[BenefitField, type] = {
 # DTMF keys always allowed regardless of the most recent menu options.
 _UNIVERSAL_DTMF_KEYS = frozenset("#*")
 
+# Wall-clock budget for the transition phase between the LLM emitting
+# `send_dtmf(purpose="rep")` and `transfer_to_rep`. Eligibility-verification
+# holds are reportedly long (often several minutes); 15min is a generous
+# ceiling that cuts off stuck calls without prematurely killing legitimate
+# holds. Tune from production telemetry once available. Bounded only across
+# a single hold period — any non-`wait` tool call clears the timer.
+_HOLD_BUDGET_S = 15 * 60
+
 
 def _reject(message: str) -> ToolResult:
     """Validation-failure result. The message goes back into history so the
@@ -136,6 +159,14 @@ async def dispatch(call: ToolCall, session: CallSession) -> ToolResult:
     except ValidationError as exc:
         return _reject(f"invalid args for {call.name}: {exc}")
 
+    # `wait` keeps the hold timer running across consecutive waits; every
+    # other dispatch path resets it (advancing breaks the hold, even if the
+    # call ultimately re-enters wait state later — that re-entry gets a
+    # fresh budget). Centralized here so each non-wait dispatcher doesn't
+    # need to remember to clear the timer.
+    if call.name != "wait":
+        session.ivr_wait_started_at = None
+
     match call.name:
         case "send_dtmf":
             assert isinstance(args, SendDTMFArgs)
@@ -155,6 +186,9 @@ async def dispatch(call: ToolCall, session: CallSession) -> ToolResult:
         case "fail_with_reason":
             assert isinstance(args, FailWithReasonArgs)
             return _dispatch_fail_with_reason(args, session)
+        case "wait":
+            assert isinstance(args, WaitArgs)
+            return _dispatch_wait(session)
 
 
 def _dispatch_send_dtmf(args: SendDTMFArgs, session: CallSession) -> ToolResult:
@@ -168,6 +202,20 @@ def _dispatch_send_dtmf(args: SendDTMFArgs, session: CallSession) -> ToolResult:
                     f"(options: {session.recent_menu_options}); pick again or "
                     "send only universal keys (#, *)."
                 )
+    if args.purpose == "rep":
+        session.rep_pending = True
+        # Surface the arming as a structured event so post-mortems can
+        # distinguish "rep never arrived" (correct rep digit pressed,
+        # 15min hold timed out) from "wrong digit pressed" (LLM thought
+        # this was the rep option, but the IVR sent us elsewhere). The
+        # `recent_menu_options` snapshot helps reconstruct the LLM's
+        # intent; without this, the only signal would be a torn history
+        # if the call were cancelled mid-turn.
+        log.info(
+            "rep_digit_pressed",
+            digits=args.digits,
+            recent_menu_options=list(session.recent_menu_options),
+        )
     return ToolResult(
         success=True,
         advanced_call_state=True,
@@ -229,6 +277,13 @@ def _dispatch_transfer_to_rep(session: CallSession) -> ToolResult:
     # as consecutive same-role messages — Anthropic 400s on those).
     if session.rep_mode_index is None:
         session.rep_mode_index = len(session.history)
+    # Transition phase is over. Clear both flags explicitly. The dispatch-
+    # entry reset already nulls `ivr_wait_started_at` for non-wait calls,
+    # so this is belt-and-suspenders — but it makes the post-condition
+    # "after transfer_to_rep, no transition-phase state remains" hold even
+    # if a future refactor calls _dispatch_transfer_to_rep outside dispatch().
+    session.rep_pending = False
+    session.ivr_wait_started_at = None
     return ToolResult(
         success=True,
         advanced_call_state=True,
@@ -258,4 +313,71 @@ def _dispatch_fail_with_reason(args: FailWithReasonArgs, session: CallSession) -
         advanced_call_state=True,
         message=f"LLM aborted: {args.reason}",
         side_effect=HangupIntent(),
+    )
+
+
+def _dispatch_wait(session: CallSession) -> ToolResult:
+    """Acknowledge a non-actionable utterance without doing anything.
+
+    Two regimes, gated by `rep_pending`:
+    - **Outside the transition window** (no rep digit pressed yet, OR already
+      transferred to rep): `wait` is free. No timer, no watchdog impact.
+      The IVR LLM uses this for opening greetings, mid-menu filler, etc.
+    - **Inside the transition window** (`send_dtmf(purpose="rep")` was
+      called and we haven't transferred yet): the first `wait` arms the
+      hold timer. Each subsequent `wait` checks elapsed time against
+      `_HOLD_BUDGET_S`; past that, the call terminates with
+      `ivr_hold_timeout`. Any non-`wait` dispatch resets the timer (handled
+      in `dispatch` above), so a successful menu interaction mid-hold
+      restarts the budget.
+
+    `advanced_call_state=False` here, but the IVR turn loop in
+    `agent/call_session.py:_ivr_turn` exempts wait-only turns from the
+    no-progress watchdog. So a deliberate non-action doesn't get conflated
+    with a stuck spin.
+
+    Known gap (deferred): outside the transition window, `wait` is
+    completely unbounded. An LLM mis-classifying every input as filler
+    could spin forever until transport disconnect. Healthcare IVRs
+    typically present a menu within a few utterances, so this hasn't
+    been observed in practice — but a separate "consecutive outside-
+    transition wait" cap is a reasonable follow-up.
+    """
+    # Defensive: `wait` is an IVR-mode tool. If we're somehow in rep mode
+    # with a stale `rep_pending=True`, that's a programming bug — log it
+    # rather than silently arming a timer.
+    if session.mode != "ivr":
+        log.warning(
+            "wait_dispatched_outside_ivr_mode",
+            mode=session.mode,
+            rep_pending=session.rep_pending,
+        )
+    if not session.rep_pending:
+        return ToolResult(
+            success=True,
+            advanced_call_state=False,
+            message="Waiting (no rep transition pending).",
+        )
+    now = time.monotonic()
+    if session.ivr_wait_started_at is None:
+        session.ivr_wait_started_at = now
+        return ToolResult(
+            success=True,
+            advanced_call_state=False,
+            message="Waiting for rep to arrive (15min budget started).",
+        )
+    elapsed = now - session.ivr_wait_started_at
+    if elapsed > _HOLD_BUDGET_S:
+        session.completion_reason = "ivr_hold_timeout"
+        log.info("ivr_hold_timeout_watchdog_tripped", elapsed_s=round(elapsed, 1))
+        return ToolResult(
+            success=True,
+            advanced_call_state=False,
+            message=f"Hold timeout after {elapsed:.0f}s; rep never arrived.",
+            side_effect=HangupIntent(),
+        )
+    return ToolResult(
+        success=True,
+        advanced_call_state=False,
+        message=f"Waiting for rep to arrive ({elapsed:.0f}s elapsed of {_HOLD_BUDGET_S}s).",
     )

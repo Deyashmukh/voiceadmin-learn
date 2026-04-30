@@ -399,6 +399,89 @@ async def test_watchdog_resets_on_an_advancing_turn(make_session: MakeSession):
         await runner.stop()
 
 
+async def test_mixed_wait_and_advancing_turn_resets_no_progress(make_session: MakeSession):
+    """A turn with BOTH a `wait` and an advancing tool (e.g., a `send_dtmf`)
+    must reset the no-progress counter via the `elif advanced` branch — the
+    `only_wait` guard is False because not all tool calls are `wait`, but
+    `advanced=True` so the counter resets. Locks the AND-of-two-conditions
+    semantics so a refactor that flips `all()` to `any()` would fail this
+    test.
+    """
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(),  # 1 no-progress (counter=1)
+        IVRTurnResponse(  # mixed: wait + send_dtmf — must reset counter
+            tool_calls=[
+                ToolCall(name="wait", args={}),
+                ToolCall(name="send_dtmf", args={"digits": "1"}),
+            ]
+        ),
+        IVRTurnResponse(  # 1 no-progress again (counter just reset, so 1 not 2)
+            tool_calls=[]
+        ),
+        IVRTurnResponse(  # advancing
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})]
+        ),
+    ]
+    try:
+        await runner.start()
+        for i in range(4):
+            runner.submit_transcript(f"transcript-{i}")
+        await wait_until(lambda: runner.session.done)
+        # Reached complete_call cleanly — no_progress never hit 2.
+        assert runner.session.completion_reason == "user_hangup"
+    finally:
+        await runner.stop()
+
+
+async def test_wait_only_turn_does_not_trip_no_progress_watchdog(
+    make_session: MakeSession,
+):
+    """`wait` is a deliberate non-action (acknowledging IVR filler), not a
+    stuck spin. A turn whose only tool was `wait` MUST be exempt from the
+    no-progress watchdog — otherwise the IVR opening sequence ('Welcome
+    to Aetna' + 'Please listen carefully') would terminate the call after
+    just two filler turns. The hold-budget watchdog inside `_dispatch_wait`
+    is the correct guard for "spent too long waiting".
+    """
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    # Three consecutive wait-only turns. Pre-fix, this would trip the
+    # 2-turn no-progress watchdog. Post-fix, the call stays alive and we
+    # finally complete via an explicit complete_call.
+    ivr_llm.responses = [
+        IVRTurnResponse(tool_calls=[ToolCall(name="wait", args={})]),
+        IVRTurnResponse(tool_calls=[ToolCall(name="wait", args={})]),
+        IVRTurnResponse(tool_calls=[ToolCall(name="wait", args={})]),
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})]
+        ),
+    ]
+    try:
+        await runner.start()
+        for i, text in enumerate(
+            ["Welcome to Aetna.", "Please listen carefully.", "Calls may be recorded.", "goodbye"]
+        ):
+            runner.submit_transcript(text)
+            if i < 3:
+                # Give the consumer a chance to process each wait turn so we
+                # observe the watchdog NOT tripping mid-sequence rather than
+                # just at the end.
+                await wait_until(
+                    lambda i=i: runner.session.turn_count > i,
+                    timeout=2.0,
+                    description=f"wait-only turn {i} processed",
+                )
+        await wait_until(lambda: runner.session.done)
+        # Exit reason must be the explicit close, NOT no-progress.
+        assert runner.session.completion_reason == "user_hangup", (
+            f"expected user_hangup, got {runner.session.completion_reason} — "
+            "wait-only turns are tripping the no-progress watchdog"
+        )
+        assert runner.session.ivr_no_progress_turns == 0
+    finally:
+        await runner.stop()
+
+
 # --- Interrupt: queue drains + task.cancel --------------------------------
 
 

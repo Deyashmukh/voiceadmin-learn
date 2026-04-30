@@ -48,11 +48,27 @@ BenefitField = Literal[
 CompleteCallReason = Literal["benefits_extracted", "ivr_dead_end", "user_hangup"]
 
 
+DTMFPurpose = Literal["menu", "rep"]
+
+
 class SendDTMFArgs(BaseModel):
     # Restrict to the DTMF wire alphabet — these are the only tones the
     # carrier recognizes regardless of how we render them. Bounds to a real
     # menu's worth of input (member ID + #/*); 20 is generous.
     digits: str = Field(min_length=1, max_length=20, pattern=r"^[0-9*#]+$")
+    # `"rep"` flags the digit as the LLM's rep-option selection — sets
+    # `session.rep_pending` so the dispatcher knows subsequent `wait` calls
+    # are inside the transition window (15-min hold budget) and conversational
+    # input on the next turn should flip to rep mode immediately. Default is
+    # `"menu"` (any normal navigation press).
+    purpose: DTMFPurpose = "menu"
+
+
+class WaitArgs(BaseModel):
+    # No args. Acknowledges the current utterance without acting — used for
+    # IVR opening greetings, hold music, hold announcements, and any non-
+    # actionable filler. Empty body keeps the Groq schema minimal.
+    pass
 
 
 class SpeakArgs(BaseModel):
@@ -79,7 +95,13 @@ class FailWithReasonArgs(BaseModel):
 # --- Tool dispatch + side effects --------------------------------------------
 
 ToolName = Literal[
-    "send_dtmf", "speak", "record_benefit", "transfer_to_rep", "complete_call", "fail_with_reason"
+    "send_dtmf",
+    "speak",
+    "record_benefit",
+    "transfer_to_rep",
+    "complete_call",
+    "fail_with_reason",
+    "wait",
 ]
 
 # Discriminator union for `SideEffectIntent.kind`. Named so consumers like
@@ -193,6 +215,7 @@ CompletionReason = (
         "transport_closed",
         "consumer_died",  # consumer task crashed unhandled — safety-net so the pipeline doesn't hang on out_queue
         "pipeline_torn_down",  # downstream push_frame failed N consecutive times — transport is gone
+        "ivr_hold_timeout",  # 15min elapsed in transition phase (rep-digit pressed, rep never arrived)
     ]
 )
 
@@ -234,6 +257,16 @@ class CallSession:
     # Anthropic's API rejects messages that don't start with a user role or
     # have consecutive same-role entries.
     rep_mode_index: int | None = None
+    # `True` between the LLM emitting `send_dtmf(purpose="rep")` and the rep
+    # actually arriving (signaled by the LLM emitting `transfer_to_rep`).
+    # Gates the 15-min hold budget on `wait` and tells the LLM that
+    # conversational input on subsequent turns means the rep arrived.
+    rep_pending: bool = False
+    # `time.monotonic()` of the first `wait` tool call after `rep_pending` was
+    # set. None outside the transition window. The dispatcher checks elapsed
+    # time on each subsequent `wait` and trips `ivr_hold_timeout` past 15min.
+    # Cleared by any non-`wait` tool dispatch (advancing breaks the hold).
+    ivr_wait_started_at: float | None = None
 
     @property
     def done(self) -> bool:
