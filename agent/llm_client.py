@@ -187,8 +187,8 @@ class GroqToolCallingClient:
             # call: empty response counts as a no-progress turn, two in a
             # row trips the watchdog. The non-obvious one: `BadRequestError`
             # is on this side, not the misconfig side, because Groq returns
-            # it for `tool_use_failed` when the LLM's output is un-
-            # classifiable for the input — looks like a 400 but is a
+            # it for `tool_use_failed` when the LLM's output is
+            # unclassifiable for the input — looks like a 400 but is
             # transient model behavior, not a config error. Non-`APIError`
             # exceptions (programmer bugs, schema drift) propagate so they
             # surface in CI / Langfuse instead of looking like LLM weirdness.

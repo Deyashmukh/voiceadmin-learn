@@ -201,6 +201,7 @@ async def test_late_transcript_after_grace_schedules_fresh_flush(make_session: M
     await wait_until(
         lambda: proc._flush_task is None,  # pyright: ignore[reportPrivateUsage]
         timeout=2.0,
+        description="flush task cleared (empty-buffer grace expired)",
     )
     assert runner.in_queue.empty()
     # Now Deepgram catches up with a late final.
@@ -233,6 +234,7 @@ async def test_flush_preserves_buffer_when_submit_raises(make_session: MakeSessi
     await wait_until(
         lambda: proc._flush_task is None,  # pyright: ignore[reportPrivateUsage]
         timeout=2.0,
+        description="flush task cleared after submit_transcript raised",
     )
     # Buffer must still hold the unsubmitted text.
     assert proc._transcript_buffer == ["Press 1 for benefits."]  # pyright: ignore[reportPrivateUsage]
