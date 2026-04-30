@@ -1,3 +1,4 @@
+# pyright: strict
 """Per-turn loop for the two-mode call session.
 
 Lives alongside the Pipecat pipeline (not inside a FrameProcessor) so LLM

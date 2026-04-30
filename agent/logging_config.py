@@ -1,3 +1,4 @@
+# pyright: strict
 """Minimal structlog setup. Call sid + turn index bind via contextvars."""
 
 from __future__ import annotations

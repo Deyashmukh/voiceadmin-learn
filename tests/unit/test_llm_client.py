@@ -1,3 +1,4 @@
+# pyright: strict
 """Unit tests for the Anthropic rep-LLM client + the FakeAnthropicRepClient
 seam, plus the GroqToolCallingClient. Zero network — the SDK call sites
 are mocked."""

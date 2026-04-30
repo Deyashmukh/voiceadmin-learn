@@ -1,3 +1,4 @@
+# pyright: strict
 """LLM clients: Anthropic for rep-mode structured output, Groq for IVR
 tool-calling. Both expose `@observe`-decorated entry points so each LLM
 round-trip surfaces as a Langfuse generation span.

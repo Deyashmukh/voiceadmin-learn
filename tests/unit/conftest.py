@@ -1,3 +1,4 @@
+# pyright: strict
 """Fakes + fixtures for offline unit tests. Zero network."""
 
 from __future__ import annotations

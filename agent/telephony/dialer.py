@@ -1,3 +1,4 @@
+# pyright: strict
 """Outbound dialer with a hard allowlist check.
 
 Every outbound call must pass through `dial()`. A typo in a Twilio number env

@@ -1,3 +1,4 @@
+# pyright: strict
 """Unit tests for the outbound dial allowlist.
 
 These tests run offline with no network calls.

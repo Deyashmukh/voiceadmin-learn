@@ -1,3 +1,4 @@
+# pyright: strict
 """Pipecat adapter for `CallSessionRunner`.
 
 Kept deliberately thin. The CLAUDE.md non-negotiable: the call loop must not

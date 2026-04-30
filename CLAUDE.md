@@ -54,7 +54,7 @@ One commit per completed milestone or logical sub-task.
 
 - **Dependency manager:** `uv` with pinned exact versions. `uv.lock` is committed.
 - **Lint + format:** `ruff` (both). `[tool.ruff.lint] select = ["E","F","I","B","UP","N","W","SIM","RUF"]`.
-- **Type check:** `pyright` strict on `agent/` and `tests/` (`[tool.pyright] strict = ["agent","tests"]`).
+- **Type check:** `pyright` strict per-file via `# pyright: strict` headers in every `.py` under `agent/` and `tests/`. Package-level `typeCheckingMode = "basic"` is the floor; new files MUST add the header or they skip strict checks.
 - **Tests:** `pytest` + `pytest-asyncio` + `pytest-cov`. Unit tests run offline with zero network calls. Coverage floor: 90% repo-wide on `agent/` (excluding `main.py`, the entrypoint exercised by live phone tests).
 - **Pre-commit:** `pre-commit` hook runs `ruff` + `pyright` before every commit (developer convenience).
 - **Logging:** `structlog` with `call_sid` and `turn_index` bound as contextvars from M2 onward.
