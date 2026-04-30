@@ -398,12 +398,21 @@ class CallSessionRunner:
                 timeout_s=REP_LLM_TIMEOUT_S,
                 history_len=len(self.session.history),
             )
-            # Race guard: if a barge-in fires between TimeoutError and the
-            # filler dispatch, `mark_interrupted` will have set
-            # `_interrupt_requested` (and drained out_queue). Skip speaking
-            # — pushing the filler into a freshly-drained queue would
-            # defeat the barge-in.
+            # Best-effort race guard: `mark_interrupted` runs synchronously
+            # from the state_processor task and sets `_interrupt_requested`
+            # before calling `_current_turn.cancel()`. Cancellation lands at
+            # the next await — which is the `actuator.execute(...)` below.
+            # Whether `await out_queue.put()` actually yields (and thus lets
+            # CancelledError fire) depends on asyncio internals: a non-full
+            # queue completes the put without yielding, so cancellation may
+            # not fire here. Checking the flag explicitly is defense-in-
+            # depth. We must also CONSUME the flag — the consumer's
+            # CancelledError handler resets it on the cancel path, but we
+            # may have skipped that path entirely by returning before any
+            # await. Without resetting, a future turn's guard would mis-
+            # fire on a stale flag.
             if self._interrupt_requested:
+                self._interrupt_requested = False
                 return
             await self.actuator.execute(SpeakIntent(text=_TIMEOUT_FILLER_REPLY))
             self.session.history.append(Turn(role="assistant", content=_TIMEOUT_FILLER_REPLY))

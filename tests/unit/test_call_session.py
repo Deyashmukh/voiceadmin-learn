@@ -817,6 +817,8 @@ async def test_rep_turn_timeout_speaks_filler_and_continues(
     second. `slow_mode_seconds=10` on the fake means the underlying
     `asyncio.sleep` is cancelled when wait_for trips — no real 10s wait.
     """
+    from agent.call_session import _TIMEOUT_FILLER_REPLY  # pyright: ignore[reportPrivateUsage]
+
     monkeypatch.setattr("agent.call_session.REP_LLM_TIMEOUT_S", 0.05)
     actuator = FakeActuator()
     rep_llm = FakeAnthropicRepClient(slow_mode_seconds=10.0, responses=[])
@@ -835,14 +837,17 @@ async def test_rep_turn_timeout_speaks_filler_and_continues(
         runner.submit_transcript("Hi, are you there?")
         await wait_until(
             lambda: any(
-                isinstance(i, SpeakIntent) and "moment" in i.text.lower() for i in actuator.executed
+                isinstance(i, SpeakIntent) and i.text == _TIMEOUT_FILLER_REPLY
+                for i in actuator.executed
             ),
             timeout=2.0,
             description="filler reply spoken after rep timeout",
         )
         speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
         assert len(speaks) == 1
-        assert "moment" in speaks[0].text.lower()
+        # Exact constant comparison — substring would silently still pass on a
+        # bad rephrase like "Just a moment longer, sorry for the trouble".
+        assert speaks[0].text == _TIMEOUT_FILLER_REPLY
         # No benefits extracted from a timed-out turn.
         assert runner.session.benefits.model_dump(exclude_none=True) == {}
         # Stuck counter NOT incremented — timeout ≠ phase=stuck.
@@ -878,12 +883,8 @@ async def test_rep_turn_timeout_skips_filler_when_interrupt_pending(
     try:
         await runner.start()
         runner.submit_transcript("Hi, are you there?")
-        # Pre-set the interrupt flag to simulate a barge-in landing in the
-        # race window. (In production, mark_interrupted() sets this after
-        # cancelling the current turn — but the timeout handler runs even
-        # when _current_turn isn't yet cancelled, so the pre-set models
-        # the worst case where mark_interrupted ran but the cancel hasn't
-        # yet hit a yield point.)
+        # Pre-set models the worst case where mark_interrupted ran but the
+        # cancel hasn't yet hit a yield point.
         await wait_until(
             lambda: runner._current_turn is not None,  # pyright: ignore[reportPrivateUsage]
             timeout=1.0,
@@ -902,6 +903,12 @@ async def test_rep_turn_timeout_skips_filler_when_interrupt_pending(
         speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
         assert len(speaks) == 0, (
             f"expected NO filler when interrupt pending; got {[s.text for s in speaks]}"
+        )
+        # The guard MUST consume the flag — otherwise a future turn's guard
+        # would mis-fire on a stale flag (we returned early without going
+        # through the consumer's CancelledError-handling reset path).
+        assert runner._interrupt_requested is False, (  # pyright: ignore[reportPrivateUsage]
+            "guard left flag stale; future turns would skip fillers incorrectly"
         )
     finally:
         await runner.stop()

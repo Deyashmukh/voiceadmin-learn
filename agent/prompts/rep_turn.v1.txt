@@ -65,7 +65,8 @@ If you've asked for the same field twice without a usable answer, set
 `phase: "stuck"` and produce a brief, friendly apology + closing line.
 
 For each rep utterance, return:
-- `reply`: what you say aloud ("" = stay silent, e.g., during hold music)
+- `reply`: what you say aloud ("" = stay silent — only acceptable during
+  pure hold music or known IVR-announcement backchannel, see rule 9)
 - `extracted`: Benefits fields you learned from THIS utterance only
   (other fields stay None)
 - `phase`: "extracting" | "complete" | "stuck"
