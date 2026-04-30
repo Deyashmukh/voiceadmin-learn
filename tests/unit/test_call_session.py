@@ -1,3 +1,4 @@
+# pyright: strict
 """Unit tests for CallSessionRunner — IVR turn loop (D1), rep turn handler
 + mode-aware dispatch (D2/D3). Zero network — both LLMs are faked; the
 default CallActuator (with no twilio_client) routes SpeakIntent into

@@ -1,3 +1,4 @@
+# pyright: strict
 """IVR tool registry + dispatcher.
 
 The LLM emits tool calls; the dispatcher validates each one structurally

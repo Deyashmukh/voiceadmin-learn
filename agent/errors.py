@@ -1,3 +1,4 @@
+# pyright: strict
 """Error taxonomy for the agent.
 
 `AgentError` is the base for every error the agent itself raises. Catch

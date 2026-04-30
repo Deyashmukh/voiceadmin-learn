@@ -1,3 +1,4 @@
+# pyright: strict
 """Property-based tests for `agent.tools.dispatch`.
 
 The dispatcher is the determinism boundary: every IVR LLM tool call passes

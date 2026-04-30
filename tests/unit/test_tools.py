@@ -1,3 +1,4 @@
+# pyright: strict
 """Unit tests for the IVR tools dispatcher + arg validation."""
 
 from __future__ import annotations

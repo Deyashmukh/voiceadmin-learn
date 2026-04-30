@@ -1,3 +1,4 @@
+# pyright: strict
 """Unit tests for `StateMachineProcessor`. Zero network."""
 
 from __future__ import annotations

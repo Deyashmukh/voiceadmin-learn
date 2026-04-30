@@ -1,3 +1,4 @@
+# pyright: strict
 """Unit tests for `agent.errors`. Locks the typed-error contract so
 catch-by-type at call sites stays correct as message text drifts."""
 

@@ -1,3 +1,4 @@
+# pyright: strict
 """Agent entrypoint: FastAPI app hosting Twilio Media Streams over a WebSocket.
 
 Run: `uv run uvicorn agent.main:app --host 0.0.0.0 --port 8000`

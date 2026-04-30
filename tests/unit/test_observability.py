@@ -1,3 +1,4 @@
+# pyright: strict
 """Unit tests for `agent.observability` — Langfuse helper wrappers.
 
 The helpers do function-local imports (`from langfuse import ...` inside each

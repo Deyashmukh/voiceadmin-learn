@@ -1,3 +1,4 @@
+# pyright: strict
 """SUPERSEDED — kept as an artifact for the real-DTMF wiring.
 
 This module's `<Play digits>`-via-TwiML-update approach is NOT the active

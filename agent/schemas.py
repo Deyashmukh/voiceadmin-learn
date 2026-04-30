@@ -1,3 +1,4 @@
+# pyright: strict
 """Shared data models for the voice agent."""
 
 from __future__ import annotations

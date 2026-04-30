@@ -1,3 +1,4 @@
+# pyright: strict
 """Unit tests for the schemas — Benefits, tool args, CallSession."""
 
 from __future__ import annotations

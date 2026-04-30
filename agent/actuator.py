@@ -1,3 +1,4 @@
+# pyright: strict
 """Executes side-effect intents emitted by the tool dispatcher.
 
 The tools layer is a pure function — it returns `ToolResult` plus an optional

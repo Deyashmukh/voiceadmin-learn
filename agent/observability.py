@@ -1,3 +1,4 @@
+# pyright: strict
 """Langfuse observability wiring.
 
 Langfuse reads credentials from env vars:
