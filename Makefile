@@ -4,7 +4,7 @@ install:
 	uv sync
 
 agent:
-	uv run python -m agent.main
+	uv run uvicorn agent.main:app --host 0.0.0.0 --port 8000
 
 test:
 	uv run pytest tests/unit
