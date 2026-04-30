@@ -124,7 +124,12 @@ transcripts queued up behind it). On timeout the runner speaks a brief
 filler so the user knows the agent is still alive, and skips merging
 benefits for that turn — the user can volunteer the value again."""
 
-_TIMEOUT_FILLER_REPLY = "One moment, let me check that."
+# Context-neutral filler — the timeout fires without us knowing what the rep
+# just said, so the line must work in any conversational position: greeting,
+# rep asking a question, rep providing a value, rep saying "hold on" themselves.
+# An earlier "One moment, let me check that" implied the agent was looking
+# something up, which only fits the "rep just gave info" context.
+_TIMEOUT_FILLER_REPLY = "Sorry, just one second."
 
 
 class IVRLLMClient(Protocol):
