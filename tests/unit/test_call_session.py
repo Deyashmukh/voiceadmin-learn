@@ -37,6 +37,7 @@ from .conftest import (
     FakeAnthropicRepClient,
     FakeIVRLLMClient,
     MakeSession,
+    submit_and_await_turn,
     wait_until,
 )
 
@@ -114,14 +115,13 @@ async def test_call_completion_appends_jsonl_record(make_session: MakeSession):
     try:
         await runner.start()
         runner.submit_transcript("Thank you, goodbye.")
-        # Wait for the consumer to finish (not just for `session.done` to
-        # flip) — JSONL write happens AFTER `session.done` is set, via
-        # `asyncio.to_thread`, and the consumer only exits once the write
-        # returns. Cancelling mid-write would leave the file unwritten.
-        await wait_until(
-            lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
-            description="consumer task done (post-write)",
-        )
+        # Wait for `session.done` to flip, then `stop()` to deterministically
+        # await the in-flight turn (which is where the JSONL write happens
+        # via `_record_completion_if_needed`'s one-shot guard). The consumer
+        # itself no longer exits on `session.done` — teardown is owned by
+        # the pipeline observer (state_processor) calling `runner.stop()`,
+        # so post-close user utterances can still route through the rep LLM.
+        await wait_until(lambda: runner.session.done)
     finally:
         await runner.stop()
     log_path = Path(os.environ["BENEFITS_LOG_PATH"])
@@ -153,12 +153,10 @@ async def test_jsonl_append_does_not_overwrite_prior_calls(make_session: MakeSes
         try:
             await runner.start()
             runner.submit_transcript("Thank you, goodbye.")
-            # Wait for the consumer to actually finish — see the equivalent
-            # comment in test_call_completion_appends_jsonl_record.
-            await wait_until(
-                lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
-                description="consumer task done (post-write)",
-            )
+            # See sibling comment in test_call_completion_appends_jsonl_record:
+            # consumer doesn't auto-exit on session.done, so wait for done
+            # and let stop() flush the in-turn JSONL write deterministically.
+            await wait_until(lambda: runner.session.done)
         finally:
             await runner.stop()
 
@@ -194,10 +192,7 @@ async def test_jsonl_write_failure_does_not_abort_call(
         try:
             await runner.start()
             runner.submit_transcript("Thank you, goodbye.")
-            await wait_until(
-                lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
-                description="consumer task done (post-write)",
-            )
+            await wait_until(lambda: runner.session.done)
         finally:
             await runner.stop()
     assert runner.session.completion_reason == "benefits_extracted"
@@ -243,10 +238,7 @@ async def test_jsonl_serialize_failure_logs_and_skips_write(
         try:
             await runner.start()
             runner.submit_transcript("Thank you, goodbye.")
-            await wait_until(
-                lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
-                description="consumer task done (post-write)",
-            )
+            await wait_until(lambda: runner.session.done)
         finally:
             await runner.stop()
     assert runner.session.completion_reason == "benefits_extracted"
@@ -279,7 +271,9 @@ async def test_ivr_turn_dispatches_send_dtmf_intent(make_session: MakeSession):
     ]
     try:
         await runner.start()
-        runner.submit_transcript("Press 1 for eligibility")
+        # Sequence with `submit_and_await_turn` so each transcript drives
+        # its own turn — back-to-back submits would coalesce into one.
+        await submit_and_await_turn(runner, "Press 1 for eligibility")
         runner.submit_transcript("Thank you, that completes the menu")
         await wait_until(lambda: runner.session.done)
         assert any(isinstance(i, DTMFIntent) and i.digits == "1" for i in actuator.executed)
@@ -299,7 +293,7 @@ async def test_ivr_turn_records_history(make_session: MakeSession):
     ]
     try:
         await runner.start()
-        runner.submit_transcript("hello")
+        await submit_and_await_turn(runner, "hello")
         runner.submit_transcript("anything")
         await wait_until(lambda: runner.session.done)
         roles = [t.role for t in runner.session.history]
@@ -349,7 +343,7 @@ async def test_validator_rejection_does_not_advance_call_state(make_session: Mak
     ]
     try:
         await runner.start()
-        runner.submit_transcript("first")
+        await submit_and_await_turn(runner, "first")
         runner.submit_transcript("second")
         await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "ivr_no_progress"
@@ -370,7 +364,7 @@ async def test_watchdog_trips_on_zero_tool_call_turns(make_session: MakeSession)
     ivr_llm.responses = [IVRTurnResponse(), IVRTurnResponse()]
     try:
         await runner.start()
-        runner.submit_transcript("first")
+        await submit_and_await_turn(runner, "first")
         runner.submit_transcript("second")
         await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "ivr_no_progress"
@@ -392,7 +386,7 @@ async def test_watchdog_resets_on_an_advancing_turn(make_session: MakeSession):
     try:
         await runner.start()
         for i in range(4):
-            runner.submit_transcript(f"transcript-{i}")
+            await submit_and_await_turn(runner, f"transcript-{i}", timeout=2.0)
         await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "ivr_no_progress"
     finally:
@@ -426,7 +420,7 @@ async def test_mixed_wait_and_advancing_turn_resets_no_progress(make_session: Ma
     try:
         await runner.start()
         for i in range(4):
-            runner.submit_transcript(f"transcript-{i}")
+            await submit_and_await_turn(runner, f"transcript-{i}", timeout=2.0)
         await wait_until(lambda: runner.session.done)
         # Reached complete_call cleanly — no_progress never hit 2.
         assert runner.session.completion_reason == "user_hangup"
@@ -612,29 +606,45 @@ async def test_stop_cancels_in_flight_turn_quickly(make_session: MakeSession):
 # --- Consumer exits cleanly when the call completes ------------------------
 
 
-async def test_consumer_exits_after_complete_call_without_extra_transcript(
+async def test_consumer_keeps_running_after_complete_call_for_post_close_acks(
     make_session: MakeSession,
 ):
-    """When the LLM emits `complete_call`, the consumer must exit the loop
-    immediately rather than blocking on `in_queue.get()` waiting for a
-    transcript that will never arrive."""
+    """When the LLM emits `complete_call`, the consumer must KEEP running so
+    a post-close user utterance (the rep volunteering extra info, "wait,
+    one more thing") still routes through the LLM. Teardown is owned by the
+    pipeline observer (`stop()`), not by `session.done`. Pre-fix, the
+    consumer exited on `session.done` and post-close user audio fell on the
+    floor — observed in live test as end-of-call dead-air after the user
+    interrupted the agent's goodbye."""
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
         IVRTurnResponse(
             tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
         ),
     ]
-    await runner.start()
-    runner.submit_transcript("Done with menu")
-    # Wait for both: session.done AND consumer task itself completes.
-    await wait_until(lambda: runner.session.done)
-    await wait_until(
-        lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
-        description="consumer task done (post-write)",
-    )
-    assert runner.session.completion_reason == "benefits_extracted"
-    # Consumer is done — stop() should be a no-op for the consumer task.
-    await runner.stop()
+    try:
+        await runner.start()
+        runner.submit_transcript("Done with menu")
+        await wait_until(lambda: runner.session.done)
+        # Wait for the JSONL one-shot to fire (i.e. the in-turn write at
+        # the end of `_run_turn` has completed). That's the actual
+        # invariant under test — `session.done` flips inside the mode
+        # handler, but `_record_completion_if_needed` runs immediately
+        # after, so by the time we observe `_benefits_recorded` the
+        # consumer has fully returned to its `in_queue.get()` await.
+        await wait_until(
+            lambda: runner._benefits_recorded,  # pyright: ignore[reportPrivateUsage]
+            description="benefits jsonl written by in-turn one-shot",
+        )
+        assert runner.session.completion_reason == "benefits_extracted"
+        consumer = runner._consumer  # pyright: ignore[reportPrivateUsage]
+        assert consumer is not None and not consumer.done(), (
+            "consumer should still be alive after complete_call so post-close "
+            "user utterances can route to the LLM (rep prompt rule #9 + "
+            "'after your close, ack briefly' guidance counts on this)"
+        )
+    finally:
+        await runner.stop()
 
 
 # --- Consumer-died safety net ---------------------------------------------
@@ -643,7 +653,10 @@ async def test_consumer_exits_after_complete_call_without_extra_transcript(
 async def test_consumer_death_sets_completion_reason(make_session: MakeSession):
     """If the consumer task crashes unhandled, the pipeline-side observer
     needs a signal to end the call instead of hanging on out_queue forever.
-    `_on_consumer_done` sets `completion_reason = consumer_died`."""
+    `_on_consumer_done` sets `completion_reason = consumer_died`. The
+    JSONL deliverable is then written via `stop()`'s call to
+    `_record_completion_if_needed` — locks the terminal-outside-a-turn
+    path that doesn't run inside `_run_turn`."""
 
     async def _exploding_dispatcher(call: ToolCall, session: CallSession) -> NoReturn:
         raise RuntimeError("boom")
@@ -660,13 +673,26 @@ async def test_consumer_death_sets_completion_reason(make_session: MakeSession):
     try:
         await runner.start()
         runner.submit_transcript("kickoff")
+        # The exploding dispatcher raises out of `_run_turn` → out of
+        # `_consume`, so the consumer DOES end here — `_on_consumer_done`
+        # then sets completion_reason="consumer_died" so the pipeline
+        # observer can terminate cleanly instead of hanging.
         await wait_until(
             lambda: runner._consumer is not None and runner._consumer.done(),  # pyright: ignore[reportPrivateUsage]
-            description="consumer task done (post-write)",
+            description="consumer task ended (unhandled dispatcher raise)",
         )
         assert runner.session.completion_reason == "consumer_died"
     finally:
         await runner.stop()
+    # `consumer_died` is set OUTSIDE any turn (in `_on_consumer_done`), so
+    # the in-turn JSONL write path can't catch it. `stop()` is the only
+    # path that does — assert it actually wrote.
+    log_path = Path(os.environ["BENEFITS_LOG_PATH"])
+    assert log_path.exists(), "stop() should have written the JSONL for consumer_died"
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["completion_reason"] == "consumer_died"
 
 
 # --- contextvar binding ----------------------------------------------------
@@ -692,7 +718,7 @@ async def test_call_sid_bound_in_contextvars_during_turn(make_session: MakeSessi
     ]
     try:
         await runner.start()
-        runner.submit_transcript("first")
+        await submit_and_await_turn(runner, "first")
         runner.submit_transcript("second")
         await wait_until(lambda: runner.session.done)
         assert len(captured) == 2
@@ -704,14 +730,86 @@ async def test_call_sid_bound_in_contextvars_during_turn(make_session: MakeSessi
         await runner.stop()
 
 
-# --- Each queued transcript drives its own turn ----------------------------
+# --- Coalescing: drain-on-dequeue joins back-to-back transcripts -----------
 
 
-async def test_each_queued_transcript_drives_its_own_turn(make_session: MakeSession):
-    """Without barge-in, multiple queued transcripts must each fire a
-    distinct turn — distinct user utterances are not collapsed."""
+async def test_back_to_back_transcripts_are_coalesced_into_one_turn(
+    make_session: MakeSession,
+):
+    """Multiple transcripts queued back-to-back MUST coalesce into one user
+    turn. Production fix for live-test post-barge-in transcript stacking: a
+    continuous user utterance fragmented by VAD into N flushes was producing
+    N rephrased agent replies. After the fix, a single LLM call processes
+    all queued fragments together and the user gets one coherent reply.
+
+    Two flavors locked here:
+    1. All three transcripts queued before the consumer wakes → one turn,
+       all three joined.
+    2. First gets its own turn, then two queued during turn 1's LLM
+       round-trip → second turn coalesces just those two."""
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
-    ivr_llm.slow_mode_seconds = 0.02
+    ivr_llm.responses = [
+        IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "one"})]),
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})]
+        ),
+    ]
+    try:
+        await runner.start()
+        # Turn 1: drain consumer to the in_queue.get() await with one
+        # transcript dispatched. Then queue two more while the consumer is
+        # blocked on the next get(). Both arrive before the consumer
+        # dequeues again, so `_coalesce_pending` joins them.
+        await submit_and_await_turn(runner, "first")
+        runner.submit_transcript("second")
+        runner.submit_transcript("third")
+        await wait_until(lambda: runner.session.done)
+        assert len(ivr_llm.calls) == 2
+        user_contents = [t.content for t in runner.session.history if t.role == "user"]
+        assert user_contents == ["first", "second third"], (
+            f"expected coalesced second turn, got {user_contents}"
+        )
+    finally:
+        await runner.stop()
+
+
+async def test_three_transcripts_queued_pre_consumer_wake_coalesce_into_one_turn(
+    make_session: MakeSession,
+):
+    """Edge case of the same fix: if the consumer hasn't picked up the
+    first transcript yet (test submits all three before yielding), all
+    three coalesce into a single turn. Locks the "drain all, not just one
+    behind" behavior — a refactor that drained at most one extra would
+    silently regress the post-barge-in symptom."""
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})]
+        ),
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("first")
+        runner.submit_transcript("second")
+        runner.submit_transcript("third")
+        await wait_until(lambda: runner.session.done)
+        assert len(ivr_llm.calls) == 1
+        user_contents = [t.content for t in runner.session.history if t.role == "user"]
+        assert user_contents == ["first second third"]
+    finally:
+        await runner.stop()
+
+
+async def test_sequenced_transcripts_each_drive_their_own_turn(
+    make_session: MakeSession,
+):
+    """The flip side of coalescing: when each `submit_transcript` is awaited
+    via `submit_and_await_turn` (so the prior turn finishes before the next
+    arrives), there's nothing to coalesce and each utterance gets its own
+    LLM round-trip. Locks the pre-coalesce-fix semantics for the sequenced
+    case so a refactor that, say, started buffering submits at the
+    submit_transcript boundary instead of `_consume` would fail this test."""
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "one"})]),
         IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "two"})]),
@@ -721,8 +819,8 @@ async def test_each_queued_transcript_drives_its_own_turn(make_session: MakeSess
     ]
     try:
         await runner.start()
-        runner.submit_transcript("first")
-        runner.submit_transcript("second")
+        await submit_and_await_turn(runner, "first")
+        await submit_and_await_turn(runner, "second")
         runner.submit_transcript("third")
         await wait_until(lambda: runner.session.done)
         assert len(ivr_llm.calls) == 3
@@ -784,7 +882,7 @@ async def test_rep_turn_speaks_reply_and_merges_partial_benefits(make_session: M
     ]
     try:
         await runner.start()
-        runner.submit_transcript("Hi, this is Sam.")
+        await submit_and_await_turn(runner, "Hi, this is Sam.")
         runner.submit_transcript("The deductible remaining is 250.")
         await wait_until(lambda: runner.session.done)
         # Two SpeakIntents (one per turn).
@@ -945,7 +1043,7 @@ async def test_rep_turn_two_consecutive_stuck_phases_end_call(make_session: Make
     ]
     try:
         await runner.start()
-        runner.submit_transcript("garbled-1")
+        await submit_and_await_turn(runner, "garbled-1")
         runner.submit_transcript("garbled-2")
         await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "rep_stuck"
@@ -971,7 +1069,7 @@ async def test_rep_turn_stuck_counter_resets_on_extracting_turn(make_session: Ma
     try:
         await runner.start()
         for i in range(4):
-            runner.submit_transcript(f"transcript-{i}")
+            await submit_and_await_turn(runner, f"transcript-{i}", timeout=2.0)
         await wait_until(lambda: runner.session.done)
         assert runner.session.completion_reason == "rep_stuck"
     finally:
@@ -993,7 +1091,7 @@ async def test_rep_turn_empty_reply_does_not_speak(make_session: MakeSession):
     ]
     try:
         await runner.start()
-        runner.submit_transcript("[hold music transcript]")
+        await submit_and_await_turn(runner, "[hold music transcript]")
         runner.submit_transcript("Final answer.")
         await wait_until(lambda: runner.session.done)
         speaks = [i for i in actuator.executed if isinstance(i, SpeakIntent)]
@@ -1073,8 +1171,10 @@ async def test_rep_turn_skips_pre_flip_history_after_transfer(make_session: Make
     ]
     try:
         await runner.start()
-        runner.submit_transcript("Press 1 for eligibility")
-        runner.submit_transcript("Connecting you to a representative")
+        # Two IVR transcripts, each driving its own turn (so we have two
+        # IVR-phase user transcripts in history at the moment of flip).
+        await submit_and_await_turn(runner, "Press 1 for eligibility")
+        await submit_and_await_turn(runner, "Connecting you to a representative")
         await wait_until(lambda: runner.session.mode == "rep")
         runner.submit_transcript("Hi, this is Sam.")
         await wait_until(lambda: runner.session.done)
