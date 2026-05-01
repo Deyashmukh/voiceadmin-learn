@@ -12,6 +12,7 @@ from typing import NamedTuple, Protocol, TypedDict, Unpack
 import pytest
 from pydantic import BaseModel
 
+from agent.call_session import CallSessionRunner
 from agent.schemas import (
     Benefits,
     CallMode,
@@ -72,6 +73,27 @@ class IVRCall(NamedTuple):
     system: str
     history: list[Turn]
     tools: list[dict[str, object]]
+
+
+async def submit_and_await_turn(
+    runner: CallSessionRunner,
+    text: str,
+    *,
+    timeout: float = 1.0,
+) -> None:
+    """Submit a transcript and yield until the resulting turn completes
+    (turn_count advances). Use this in tests that need each `submit` to
+    drive its own turn — back-to-back `submit_transcript` calls without
+    intervening waits get coalesced into a single user turn by the runner's
+    drain-on-dequeue (production fix for post-barge-in transcript stacking;
+    also collapses the multi-turn assertion many tests rely on)."""
+    starting = runner.session.turn_count
+    runner.submit_transcript(text)
+    await wait_until(
+        lambda: runner.session.turn_count > starting,
+        timeout=timeout,
+        description=f"turn after submit_transcript({text!r})",
+    )
 
 
 async def wait_until(

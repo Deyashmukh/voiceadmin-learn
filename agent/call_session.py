@@ -201,6 +201,13 @@ class CallSessionRunner:
         self._consumer: asyncio.Task[None] | None = None
         self._current_turn: asyncio.Task[None] | None = None
         self._interrupt_requested: bool = False
+        # One-shot: flips True the first time `_record_completion_if_needed`
+        # actually fires the JSONL write. Both the in-turn call site (in
+        # `_run_turn` after the mode-specific handler returns) and the
+        # `stop()`-time call site share this flag, so a terminal
+        # `completion_reason` set outside any turn (consumer_died,
+        # pipeline_torn_down) still produces exactly one JSONL line.
+        self._benefits_recorded: bool = False
 
     # --- Public API (called from Pipecat side) ------------------------------
 
@@ -261,17 +268,29 @@ class CallSessionRunner:
             except Exception as exc:
                 # A task that crashed during shutdown is still a real bug.
                 log.warning("task_error_during_stop", task=task.get_name(), error=str(exc))
+        # Catch the terminal `completion_reason` cases that don't run inside
+        # any turn (`_on_consumer_done` → "consumer_died", state_processor's
+        # pump-giving-up → "pipeline_torn_down"), and the rare in-turn case
+        # where cancellation landed between completion_reason being set and
+        # `_run_turn`'s own write call. The one-shot flag makes this idempotent
+        # against the in-turn write that already happened on the happy path.
+        await self._record_completion_if_needed()
 
     # --- Internal loop ------------------------------------------------------
 
     async def _consume(self) -> None:
         structlog.contextvars.bind_contextvars(call_sid=self.session.call_sid, turn_index=0)
         while True:
-            # Each transcript = one turn. Staleness only applies on barge-in,
-            # which mark_interrupted handles by draining in_queue. If turns
-            # back up because the LLM is slow, in_queue's drop-oldest-on-full
-            # bounds growth.
-            transcript = await self.in_queue.get()
+            # One transcript = one turn — UNLESS more transcripts queued up
+            # behind it during the previous turn's LLM round-trip, in which
+            # case `_coalesce_pending` joins them all into a single user turn.
+            # A continuous user utterance fragmented by VAD into N flushes
+            # would otherwise produce N rephrased agent replies (observed in
+            # live test post-barge-in: three "good morning" replies for one
+            # user "good morning"). Staleness on barge-in is still handled by
+            # `mark_interrupted`'s synchronous queue drain.
+            first = await self.in_queue.get()
+            transcript = self._coalesce_pending(first)
             structlog.contextvars.bind_contextvars(turn_index=self.session.turn_count)
             self._current_turn = asyncio.create_task(
                 self._run_turn(transcript), name=f"turn-{self.session.turn_count}"
@@ -284,18 +303,87 @@ class CallSessionRunner:
                     log.info("turn_cancelled", reason="interrupt")
                     continue
                 raise
-            # After a successful (non-cancelled) turn: if it terminated the
-            # call, exit before re-entering `in_queue.get()` — otherwise the
-            # consumer would block forever waiting for a transcript that
-            # never comes.
-            if self.session.done:
-                log.info(
-                    "call_session_complete",
-                    reason=self.session.completion_reason,
-                    benefits=self.session.benefits.model_dump(),
-                )
-                await _append_benefits_record(self.session)
-                return
+            # Don't exit on `session.done`: the user may still speak after
+            # the rep LLM emits phase="complete" (the prompt's rule #9 +
+            # "after your close, ack briefly" guidance counts on us routing
+            # post-close acks back through the rep LLM). Teardown is owned
+            # by the pipeline observer — when transport disconnects, the
+            # state processor calls `runner.stop()`, which cancels this
+            # consumer. The JSONL write happens inside `_run_turn` the
+            # moment `completion_reason` is first set; further turns past
+            # the close are no-ops on the one-shot guard.
+
+    def _coalesce_pending(self, first: str) -> str:
+        """Join `first` with any other transcripts currently sitting in
+        `in_queue`. The queue is bounded at QUEUE_MAX so the drained list is
+        bounded by construction; the explicit cap is defensive against a
+        future maxsize-changing refactor and surfaces a "we coalesced this
+        many" log line that's grep-able under live-test triage.
+
+        Coalescing happens BEFORE turn dispatch and WITHOUT mode awareness
+        — transcripts queued during an IVR turn that ends in
+        `transfer_to_rep` get processed as part of the first rep turn. That
+        is the desired behavior in practice (a fragmented user utterance
+        spanning the flip should still arrive as one user turn), and the
+        rep LLM is robust to a heterogeneous user message.
+        """
+        joined: list[str] = [first]
+        while len(joined) < QUEUE_MAX and not self.in_queue.empty():
+            try:
+                joined.append(self.in_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        joined_text = " ".join(joined)
+        if len(joined) > 1:
+            log.info(
+                "transcript_coalesced",
+                count=len(joined),
+                preview=joined_text[:_LOG_PREVIEW_CHARS],
+            )
+        return joined_text
+
+    async def _record_completion_if_needed(self) -> None:
+        """One-shot: log + write the per-call benefits JSONL the first time
+        `completion_reason` is observed set. Two callers — `_run_turn` for
+        in-turn completions, `stop()` for terminal-outside-a-turn cases —
+        share the `_benefits_recorded` flag so exactly one line per call.
+
+        Flag flips in `finally`, which is the only ordering that's correct
+        under cancellation:
+        - Flag-before-await: barge-in cancels the `to_thread` await; the
+          worker thread completes the file write but the flag was already
+          set, so a future call short-circuits — record persisted, flag
+          consistent.  But if cancel lands BEFORE the await dispatches
+          to_thread (rare, during the `json.dumps` prelude), the flag is
+          set with NO write — record lost, no retry. Strictly worse than
+          finally.
+        - Flag-after-await: same cancel-lands-during-to_thread case sees
+          the worker thread complete the write but the flag NEVER set
+          (cancel raises out of the await before reaching the assignment).
+          `stop()` then retries and double-writes — two JSONL lines for
+          one call.
+        - Flag-in-finally: the assignment runs whether the await returned
+          normally, raised, or was cancelled. The worker thread always
+          completes its write (asyncio cancellation doesn't propagate to
+          `to_thread` workers), so the file is correct in every case
+          except the narrow cancel-before-dispatch window — where we lose
+          the record but never double-write. That trade is the right one:
+          `_append_benefits_record` is already best-effort (OSErrors
+          logged, not raised), so a single missed record on shutdown
+          cancel matches its existing contract."""
+        if self._benefits_recorded:
+            return
+        if self.session.completion_reason is None:
+            return
+        log.info(
+            "call_session_complete",
+            reason=self.session.completion_reason,
+            benefits=self.session.benefits.model_dump(),
+        )
+        try:
+            await _append_benefits_record(self.session)
+        finally:
+            self._benefits_recorded = True
 
     @observe(name="call_turn")
     async def _run_turn(self, transcript: str) -> None:
@@ -309,6 +397,7 @@ class CallSessionRunner:
             else:
                 await self._ivr_turn()
             self.session.turn_count += 1
+            await self._record_completion_if_needed()
 
     @observe(name="ivr_turn")
     async def _ivr_turn(self) -> None:
