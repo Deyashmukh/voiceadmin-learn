@@ -12,6 +12,7 @@ from typing import NamedTuple, Protocol, TypedDict, Unpack
 import pytest
 from pydantic import BaseModel
 
+from agent.call_session import CallSessionRunner
 from agent.schemas import (
     Benefits,
     CallMode,
@@ -72,6 +73,45 @@ class IVRCall(NamedTuple):
     system: str
     history: list[Turn]
     tools: list[dict[str, object]]
+
+
+async def submit_and_await_turn(
+    runner: CallSessionRunner,
+    text: str,
+    *,
+    timeout: float = 1.0,
+) -> None:
+    """Submit a transcript and yield until the resulting turn completes
+    (turn_count advances). Use this in tests that need each `submit` to
+    drive its own turn — back-to-back `submit_transcript` calls without
+    intervening waits get coalesced into a single user turn by the runner's
+    drain-on-dequeue (production fix for post-barge-in transcript stacking;
+    also collapses the multi-turn assertion many tests rely on).
+
+    On timeout, surface the underlying consumer-task exception (if any)
+    instead of raising a generic `wait_until` AssertionError. Without
+    this, a test where the dispatcher / LLM client raises mid-turn fails
+    with "timed out waiting on turn after submit_transcript(...)" — the
+    real RuntimeError is buried on the dead consumer task and never
+    reaches the investigator."""
+    starting = runner.session.turn_count
+    runner.submit_transcript(text)
+    try:
+        await wait_until(
+            lambda: runner.session.turn_count > starting,
+            timeout=timeout,
+            description=f"turn after submit_transcript({text!r})",
+        )
+    except AssertionError:
+        consumer = runner._consumer  # pyright: ignore[reportPrivateUsage]
+        if consumer is not None and consumer.done() and not consumer.cancelled():
+            consumer_exc = consumer.exception()
+            if consumer_exc is not None:
+                raise AssertionError(
+                    f"consumer task died during submit_and_await_turn({text!r}): "
+                    f"{type(consumer_exc).__name__}: {consumer_exc}"
+                ) from consumer_exc
+        raise
 
 
 async def wait_until(
