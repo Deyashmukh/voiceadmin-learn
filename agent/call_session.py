@@ -218,7 +218,16 @@ class CallSessionRunner:
         now drops a complete IVR menu the LLM never gets to see. Log
         loudly when it happens so a "the agent silently skipped a menu"
         symptom is greppable.
+
+        Empty/whitespace-only transcripts never enter the queue. The
+        production path already strips at `state_processor.py:116`, but
+        enforcing here too means side channels (replay harness, future
+        tests) can't smuggle empties past the boundary — and downstream
+        `_coalesce_pending` doesn't need a defensive filter that wastes
+        a queue slot to drop the empty.
         """
+        if not text.strip():
+            return
         log.info("transcript_submitted", mode=self.session.mode, text=text[:_LOG_PREVIEW_CHARS])
         try:
             self.in_queue.put_nowait(text)
@@ -357,14 +366,7 @@ class CallSessionRunner:
                     joined_so_far=len(joined),
                 )
                 break
-            # Skip empty/whitespace-only drained fragments. state_processor's
-            # `frame.text.strip()` filter at the submit boundary makes this
-            # defensive today, but a future side channel (replay harness,
-            # hypothesis test) could enqueue empties — without filtering,
-            # `" ".join(["foo", "", "bar"])` produces a double-space that
-            # confuses the LLM and inflates the coalesce count.
-            if item.strip():
-                joined.append(item)
+            joined.append(item)
         joined_text = " ".join(joined)
         if len(joined) > 1:
             log.info(
