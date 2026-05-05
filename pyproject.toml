@@ -1,5 +1,5 @@
 [project]
-name = "voiceadmin-learn"
+name = "healthcare-voice-agent"
 version = "0.1.0"
 description = "Hybrid voice agent for eligibility verification — learning project."
 readme = "README.md"

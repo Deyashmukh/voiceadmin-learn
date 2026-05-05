@@ -1,4 +1,4 @@
-# voiceadmin-learn
+# healthcare-voice-agent
 
 Hybrid voice agent (two-mode `CallSession` + Pipecat audio pipeline + Twilio
 telephony) that automates healthcare eligibility verification calls. A

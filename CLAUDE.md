@@ -1,4 +1,4 @@
-# VoiceAdmin Learn — Project Instructions
+# Healthcare Voice Agent — Project Instructions
 
 This is a learning project: a hybrid voice agent (two-mode `CallSession` + Pipecat audio pipeline + Twilio telephony) that automates healthcare eligibility verification calls. IVR navigation runs an LLM-with-tools loop; rep conversation runs a structured-output LLM (`RepTurnOutput`). The goal is to internalize how production voice agents are architected — including the development discipline (typing, tests, CI, error handling, observability) that production-grade work demands.
 
