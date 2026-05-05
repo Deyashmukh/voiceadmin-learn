@@ -299,7 +299,7 @@ If a hold *announcement* gets transcribed (e.g., *"please continue to hold"*), i
 ## Key files (post-pivot)
 
 ```
-voiceadmin-learn/
+healthcare-voice-agent/
 ├── README.md
 ├── Makefile
 ├── pyproject.toml                    # langgraph + langchain OUT, anthropic IN
