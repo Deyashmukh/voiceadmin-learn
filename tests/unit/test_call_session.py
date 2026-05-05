@@ -615,23 +615,28 @@ async def test_consumer_keeps_running_after_complete_call_for_post_close_acks(
     pipeline observer (`stop()`), not by `session.done`. Pre-fix, the
     consumer exited on `session.done` and post-close user audio fell on the
     floor — observed in live test as end-of-call dead-air after the user
-    interrupted the agent's goodbye."""
+    interrupted the agent's goodbye.
+
+    Asserts BOTH halves of the contract:
+    1. Consumer survives `session.done` (alive after complete_call).
+    2. A post-close transcript actually drives a second LLM round-trip
+       and reaches history. Without (2), a regression that left the
+       consumer alive but added a "skip if session.done" check anywhere
+       in the dequeue path would silently pass."""
     runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
     ivr_llm.responses = [
         IVRTurnResponse(
             tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
         ),
+        # Post-close ack: a brief speak — what the rep prompt's lines 61-62
+        # ("ack briefly, stay phase: complete") would emit after the user
+        # volunteers extra info. We assert this turn actually fires.
+        IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "noted, thanks!"})]),
     ]
     try:
         await runner.start()
         runner.submit_transcript("Done with menu")
         await wait_until(lambda: runner.session.done)
-        # Wait for the JSONL one-shot to fire (i.e. the in-turn write at
-        # the end of `_run_turn` has completed). That's the actual
-        # invariant under test — `session.done` flips inside the mode
-        # handler, but `_record_completion_if_needed` runs immediately
-        # after, so by the time we observe `_benefits_recorded` the
-        # consumer has fully returned to its `in_queue.get()` await.
         await wait_until(
             lambda: runner._benefits_recorded,  # pyright: ignore[reportPrivateUsage]
             description="benefits jsonl written by in-turn one-shot",
@@ -642,6 +647,18 @@ async def test_consumer_keeps_running_after_complete_call_for_post_close_acks(
             "consumer should still be alive after complete_call so post-close "
             "user utterances can route to the LLM — the rep persona prompt's "
             "post-close ack paragraph (rep_turn.v1.txt:61-62) counts on this"
+        )
+        # Drive the actual post-close turn — locks the load-bearing claim
+        # that subsequent transcripts produce a real LLM call rather than
+        # falling on the floor.
+        ivr_call_count_before = len(ivr_llm.calls)
+        await submit_and_await_turn(runner, "wait, one more thing")
+        assert len(ivr_llm.calls) == ivr_call_count_before + 1, (
+            "post-close transcript should have driven a second LLM round-trip"
+        )
+        user_contents = [t.content for t in runner.session.history if t.role == "user"]
+        assert "wait, one more thing" in user_contents, (
+            "post-close user utterance should have reached history"
         )
     finally:
         await runner.stop()
@@ -693,6 +710,30 @@ async def test_consumer_death_sets_completion_reason(make_session: MakeSession):
     assert len(lines) == 1
     record = json.loads(lines[0])
     assert record["completion_reason"] == "consumer_died"
+
+
+async def test_stop_writes_jsonl_for_pipeline_torn_down(make_session: MakeSession):
+    """Symmetric coverage with `consumer_died` for the other terminal-
+    outside-a-turn case. `state_processor`'s pump-gives-up handler sets
+    `completion_reason = "pipeline_torn_down"` (state_processor.py:261)
+    after consecutive `push_frame` failures — that side effect is set
+    OUTSIDE any turn, so only `stop()`'s call to
+    `_record_completion_if_needed` can persist the deliverable. Models
+    the side effect directly here rather than via the full
+    state_processor harness; the cross-file integration is tested in
+    test_state_processor.py."""
+    runner, _, _ = _build_runner(make_session(), actuator=FakeActuator())
+    try:
+        await runner.start()
+        runner.session.completion_reason = "pipeline_torn_down"
+    finally:
+        await runner.stop()
+    log_path = Path(os.environ["BENEFITS_LOG_PATH"])
+    assert log_path.exists(), "stop() should have written the JSONL for pipeline_torn_down"
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["completion_reason"] == "pipeline_torn_down"
 
 
 # --- contextvar binding ----------------------------------------------------
@@ -828,6 +869,92 @@ async def test_sequenced_transcripts_each_drive_their_own_turn(
         assert user_contents == ["first", "second", "third"]
     finally:
         await runner.stop()
+
+
+async def test_coalesce_after_barge_in_drops_stale_transcripts(make_session: MakeSession):
+    """Composition test for the two queue-draining mechanisms: a barge-in
+    drains `in_queue` synchronously, and the next turn must see only
+    fresh transcripts queued POST-barge-in — not stale transcripts that
+    might race the drain. This is the original-bug surface (post-barge-in
+    transcript stacking is what motivated the coalesce fix), and a
+    regression where a future refactor moved the drain order or dropped
+    the `in_queue` drain from `mark_interrupted` would silently re-break
+    it.
+
+    Sequence: kickoff turn (slow LLM) → queue stale transcripts during
+    that turn → barge-in (cancels turn, drains queue) → submit fresh
+    transcript → assert next turn's user content is exactly the fresh
+    one with no stale fragments coalesced in."""
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.slow_mode_seconds = 0.1
+    ivr_llm.responses = [
+        IVRTurnResponse(tool_calls=[ToolCall(name="speak", args={"text": "won't reach"})]),
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})]
+        ),
+    ]
+    try:
+        await runner.start()
+        runner.submit_transcript("kickoff")
+        await wait_until(
+            lambda: runner._current_turn is not None and not runner._current_turn.done(),  # pyright: ignore[reportPrivateUsage]
+            description="kickoff turn in flight",
+        )
+        # Queue stale transcripts during the slow turn — these would feed
+        # the next turn if `mark_interrupted`'s drain regressed.
+        runner.submit_transcript("stale-1")
+        runner.submit_transcript("stale-2")
+        runner.mark_interrupted()
+        await wait_until(
+            lambda: runner._current_turn is not None and runner._current_turn.done(),  # pyright: ignore[reportPrivateUsage]
+            description="kickoff turn cancelled",
+        )
+        # Now the queue should be drained. Submit fresh — that's what the
+        # next turn must process, and only that.
+        ivr_llm.slow_mode_seconds = 0.0
+        runner.submit_transcript("fresh post-barge-in")
+        await wait_until(lambda: runner.session.done)
+        post_barge_user = [t.content for t in runner.session.history if t.role == "user"][
+            1:
+        ]  # skip "kickoff" from the cancelled turn
+        assert post_barge_user == ["fresh post-barge-in"], (
+            f"expected only the fresh post-barge-in transcript, got {post_barge_user} — "
+            "stale transcripts leaked across the barge-in drain"
+        )
+    finally:
+        await runner.stop()
+
+
+async def test_coalesce_emits_transcript_coalesced_log_event(make_session: MakeSession):
+    """Pin the `transcript_coalesced` log event name + shape so a refactor
+    that renames the event or drops `count`/`preview` doesn't silently
+    break live-test triage greppability. Mirrors the precedent set by
+    test_pump_gives_up_after_consecutive_failures_and_keeps_draining in
+    test_state_processor.py."""
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "user_hangup"})]
+        ),
+    ]
+    with structlog.testing.capture_logs() as captured:
+        try:
+            await runner.start()
+            runner.submit_transcript("first fragment")
+            runner.submit_transcript("second fragment")
+            runner.submit_transcript("third fragment")
+            await wait_until(lambda: runner.session.done)
+        finally:
+            await runner.stop()
+    coalesce_events = [e for e in captured if e.get("event") == "transcript_coalesced"]
+    assert len(coalesce_events) == 1, (
+        f"expected exactly one transcript_coalesced event, got {len(coalesce_events)}"
+    )
+    event = coalesce_events[0]
+    assert event["count"] == 3
+    assert "first fragment" in event["preview"]
+    assert "second fragment" in event["preview"]
+    assert "third fragment" in event["preview"]
 
 
 # --- DTMFIntent currently routes through speech (TEMP — see actuator.py) ---
