@@ -97,6 +97,20 @@ async def test_submit_transcript_drops_oldest_when_full(make_session: MakeSessio
     )
 
 
+async def test_submit_transcript_skips_empty_and_whitespace(make_session: MakeSession):
+    """The empty-skip lives at the submit boundary (commit `f70b412`) so a
+    side channel (replay harness, future tests) can't smuggle empties past
+    it and force `_coalesce_pending` to filter them at dequeue (which would
+    waste a queue slot and could drop a non-empty transcript via
+    drop-oldest). Pin the contract so a future "this filter is redundant
+    with state_processor" deletion would fail this test."""
+    runner, _, _ = _build_runner(make_session())
+    runner.submit_transcript("")
+    runner.submit_transcript("   ")
+    runner.submit_transcript("\t\n")
+    assert runner.in_queue.empty()
+
+
 # --- IVR turn happy path ----------------------------------------------------
 
 
@@ -256,6 +270,83 @@ async def test_jsonl_serialize_failure_logs_and_skips_write(
     assert not log_path.exists(), (
         "log file was created despite serialize failure; serialize-then-write ordering is broken"
     )
+
+
+async def test_unexpected_record_error_is_caught_and_consumer_stays_alive(
+    make_session: MakeSession, monkeypatch: pytest.MonkeyPatch
+):
+    """`_append_benefits_record` only catches `(TypeError, ValueError)` around
+    the dumps and `OSError` around `to_thread`. Anything else (e.g.
+    `RuntimeError` from a shut-down default executor, hypothetical future
+    `pydantic.ValidationError` from a custom serializer) would propagate
+    out of `_run_turn` → out of `_consume` → kill the consumer task.
+
+    The C1 catch in `_record_completion_if_needed` swallows + logs so the
+    consumer survives. Asserts:
+    1. The error is logged as `benefits_record_unexpected_error`.
+    2. The end-of-call observability marker
+       `call_session_completed_without_deliverable` fires (added on the
+       re-review pass for I-A) — without it the failure was buried in
+       generic error noise.
+    3. The consumer task does NOT die.
+    4. The flag flips so `stop()`'s retry doesn't loop on the same error.
+
+    A future refactor that narrows the catch back to `except OSError`
+    would silently regress this; the test would fail on (3) since the
+    RuntimeError would propagate."""
+
+    async def _raising_record(_session: CallSession) -> NoReturn:
+        raise RuntimeError("simulated executor shutdown")
+
+    monkeypatch.setattr("agent.call_session._append_benefits_record", _raising_record)
+    runner, ivr_llm, _rep = _build_runner(make_session(), actuator=FakeActuator())
+    ivr_llm.responses = [
+        IVRTurnResponse(
+            tool_calls=[ToolCall(name="complete_call", args={"reason": "benefits_extracted"})]
+        )
+    ]
+    with structlog.testing.capture_logs() as captured:
+        try:
+            await runner.start()
+            runner.submit_transcript("Done.")
+            await wait_until(
+                lambda: runner._benefits_recorded,  # pyright: ignore[reportPrivateUsage]
+                description="benefits flag flipped despite write failure",
+            )
+        finally:
+            await runner.stop()
+    unexpected_events = [
+        e
+        for e in captured
+        if e.get("event") == "benefits_record_unexpected_error" and e.get("log_level") == "error"
+    ]
+    assert len(unexpected_events) == 1, (
+        f"expected one error-level benefits_record_unexpected_error, got {len(unexpected_events)}"
+    )
+    assert unexpected_events[0]["error_class"] == "RuntimeError"
+    deliverable_events = [
+        e
+        for e in captured
+        if e.get("event") == "call_session_completed_without_deliverable"
+        and e.get("log_level") == "error"
+    ]
+    assert len(deliverable_events) == 1, (
+        f"expected one error-level call_session_completed_without_deliverable, "
+        f"got {len(deliverable_events)} — without this event, the deliverable "
+        "loss is buried among other error logs"
+    )
+    assert deliverable_events[0]["cause"] == "record_unexpected_error"
+    consumer = runner._consumer  # pyright: ignore[reportPrivateUsage]
+    # `stop()` cancelled the consumer in the finally block, so it's now
+    # done — but it should be done via cancellation, NOT via an unhandled
+    # exception. A propagated RuntimeError would have set
+    # `task.exception()` non-None and triggered `_on_consumer_died`.
+    assert consumer is not None
+    assert consumer.cancelled() or consumer.exception() is None, (
+        "consumer should not have died with an exception — the C1 catch "
+        "must keep it alive through the JSONL write failure"
+    )
+    assert runner.session.completion_reason == "benefits_extracted"
 
 
 async def test_ivr_turn_dispatches_send_dtmf_intent(make_session: MakeSession):
