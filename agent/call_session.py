@@ -348,29 +348,27 @@ class CallSessionRunner:
         in-turn completions, `stop()` for terminal-outside-a-turn cases —
         share the `_benefits_recorded` flag so exactly one line per call.
 
-        Flag flips in `finally`, which is the only ordering that's correct
-        under cancellation:
-        - Flag-before-await: barge-in cancels the `to_thread` await; the
-          worker thread completes the file write but the flag was already
-          set, so a future call short-circuits — record persisted, flag
-          consistent.  But if cancel lands BEFORE the await dispatches
-          to_thread (rare, during the `json.dumps` prelude), the flag is
-          set with NO write — record lost, no retry. Strictly worse than
-          finally.
-        - Flag-after-await: same cancel-lands-during-to_thread case sees
-          the worker thread complete the write but the flag NEVER set
-          (cancel raises out of the await before reaching the assignment).
-          `stop()` then retries and double-writes — two JSONL lines for
-          one call.
-        - Flag-in-finally: the assignment runs whether the await returned
-          normally, raised, or was cancelled. The worker thread always
-          completes its write (asyncio cancellation doesn't propagate to
-          `to_thread` workers), so the file is correct in every case
-          except the narrow cancel-before-dispatch window — where we lose
-          the record but never double-write. That trade is the right one:
-          `_append_benefits_record` is already best-effort (OSErrors
-          logged, not raised), so a single missed record on shutdown
-          cancel matches its existing contract."""
+        Load-bearing fact: `asyncio.to_thread` workers don't see
+        `CancelledError`, so once `_append_benefits_record` has dispatched
+        the worker the file write completes regardless of cancellation in
+        the awaiter. Flag flips in `finally` so the at-most-once invariant
+        holds in every cancel scenario except the narrow window where
+        cancel lands BEFORE `_append_benefits_record` dispatches the
+        worker (during the `json.dumps` prelude) — in that case the
+        record is lost but we never double-write. Trade is consistent
+        with `_append_benefits_record`'s "best-effort, logged not raised"
+        contract.
+
+        The `except Exception` is C1 from review: `_append_benefits_record`
+        only catches `(TypeError, ValueError)` around the dumps and
+        `OSError` around `to_thread`. Anything else (RuntimeError from a
+        shut-down default executor, ValidationError from a future
+        custom-serializer field, UnicodeEncodeError from a worker, etc.)
+        would otherwise propagate out of `_run_turn` → out of `_consume`
+        → kill the consumer task → land in `_on_consumer_done` as a
+        misleading `consumer_died` while the flag is already set,
+        permanently disabling `stop()`'s retry. Catch + log + don't raise
+        keeps the failure observable AND keeps the consumer alive."""
         if self._benefits_recorded:
             return
         if self.session.completion_reason is None:
@@ -382,6 +380,24 @@ class CallSessionRunner:
         )
         try:
             await _append_benefits_record(self.session)
+        except asyncio.CancelledError:
+            # Visibility for I1 from review: without this log, an
+            # investigator sees `call_session_complete` immediately above
+            # and no JSONL line, with no signal distinguishing "we tried
+            # but were cancelled" from "the writer crashed silently."
+            log.warning(
+                "benefits_record_skipped_due_to_cancel",
+                call_sid=self.session.call_sid,
+                reason=self.session.completion_reason,
+            )
+            raise
+        except Exception as exc:
+            log.error(
+                "benefits_record_unexpected_error",
+                call_sid=self.session.call_sid,
+                error_class=type(exc).__name__,
+                error=str(exc),
+            )
         finally:
             self._benefits_recorded = True
 
@@ -548,7 +564,17 @@ class CallSessionRunner:
     def _on_consumer_done(self, task: asyncio.Task[None]) -> None:
         """If the consumer dies with an unhandled exception, the pipeline keeps
         awaiting `out_queue` forever. Set a completion reason so the
-        pipeline-side observer terminates the call instead of hanging."""
+        pipeline-side observer terminates the call instead of hanging.
+
+        Sync done-callback — can't `await` `_record_completion_if_needed`
+        from here, so the JSONL deliverable stays pending until `stop()`
+        runs (called from the pipeline observer's `_stop` on transport
+        disconnect). If the observer never fires (Pipecat transport bug,
+        SIGKILL before disconnect, etc.), the deliverable is lost. The
+        `benefits_record_pending_stop` log line below makes that
+        observable — without it, an investigator sees only
+        `call_session_consumer_died` and can't distinguish "we wrote the
+        JSONL via stop()" from "we never got asked to write."""
         if task.cancelled():
             return
         exc = task.exception()
@@ -557,6 +583,12 @@ class CallSessionRunner:
         log.error("call_session_consumer_died", error=str(exc))
         if self.session.completion_reason is None:
             self.session.completion_reason = "consumer_died"
+        if not self._benefits_recorded:
+            log.warning(
+                "benefits_record_pending_stop",
+                call_sid=self.session.call_sid,
+                reason=self.session.completion_reason,
+            )
 
 
 def _history_to_anthropic_messages(history: list[Turn]) -> list[dict[str, Any]]:
