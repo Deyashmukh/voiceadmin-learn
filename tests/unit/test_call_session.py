@@ -640,8 +640,8 @@ async def test_consumer_keeps_running_after_complete_call_for_post_close_acks(
         consumer = runner._consumer  # pyright: ignore[reportPrivateUsage]
         assert consumer is not None and not consumer.done(), (
             "consumer should still be alive after complete_call so post-close "
-            "user utterances can route to the LLM (rep prompt rule #9 + "
-            "'after your close, ack briefly' guidance counts on this)"
+            "user utterances can route to the LLM — the rep persona prompt's "
+            "post-close ack paragraph (rep_turn.v1.txt:61-62) counts on this"
         )
     finally:
         await runner.stop()

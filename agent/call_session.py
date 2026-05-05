@@ -266,8 +266,16 @@ class CallSessionRunner:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                # A task that crashed during shutdown is still a real bug.
-                log.warning("task_error_during_stop", task=task.get_name(), error=str(exc))
+                # A task that crashed during shutdown is still a real bug —
+                # log at error level so it surfaces in production triage,
+                # with `error_class` for grouping (matches the convention
+                # in `_append_benefits_record`).
+                log.error(
+                    "task_error_during_stop",
+                    task=task.get_name(),
+                    error_class=type(exc).__name__,
+                    error=str(exc),
+                )
         # Catch the terminal `completion_reason` cases that don't run inside
         # any turn (`_on_consumer_done` → "consumer_died", state_processor's
         # pump-giving-up → "pipeline_torn_down"), and the rare in-turn case
@@ -304,14 +312,17 @@ class CallSessionRunner:
                     continue
                 raise
             # Don't exit on `session.done`: the user may still speak after
-            # the rep LLM emits phase="complete" (the prompt's rule #9 +
-            # "after your close, ack briefly" guidance counts on us routing
-            # post-close acks back through the rep LLM). Teardown is owned
-            # by the pipeline observer — when transport disconnects, the
-            # state processor calls `runner.stop()`, which cancels this
-            # consumer. The JSONL write happens inside `_run_turn` the
-            # moment `completion_reason` is first set; further turns past
-            # the close are no-ops on the one-shot guard.
+            # the rep LLM emits phase="complete". The rep persona prompt's
+            # post-close guidance ("After your close, if the rep volunteers
+            # extra info, ack briefly and stay phase: complete", lines 61-62
+            # of rep_turn.v1.txt) counts on us routing those acks back
+            # through the rep LLM — reinforced by rule #9's anti-silence
+            # rule. Teardown is owned by the pipeline observer — when
+            # transport disconnects, the state processor calls
+            # `runner.stop()`, which cancels this consumer. The JSONL
+            # write happens inside `_run_turn` the moment
+            # `completion_reason` is first set; further turns past the
+            # close are no-ops on the one-shot guard.
 
     def _coalesce_pending(self, first: str) -> str:
         """Join `first` with any other transcripts currently sitting in
@@ -328,11 +339,32 @@ class CallSessionRunner:
         rep LLM is robust to a heterogeneous user message.
         """
         joined: list[str] = [first]
-        while len(joined) < QUEUE_MAX and not self.in_queue.empty():
+        # Cap by `in_queue.maxsize` (not `QUEUE_MAX`) — the queue size is
+        # configurable per-runner via `in_queue_size=` so a hard-coded
+        # constant would under-drain a resized queue and re-introduce
+        # post-coalesce stale turns.
+        cap = max(self.in_queue.maxsize, 1)
+        while len(joined) < cap and not self.in_queue.empty():
             try:
-                joined.append(self.in_queue.get_nowait())
+                item = self.in_queue.get_nowait()
             except asyncio.QueueEmpty:
+                # Single-consumer architecture means the only writer is
+                # `submit_transcript` (sync) and the only reader is this
+                # method (sync get_nowait) — empty() lying would mean a
+                # concurrent drain is happening, which is itself a bug.
+                log.warning(
+                    "coalesce_queue_race",
+                    joined_so_far=len(joined),
+                )
                 break
+            # Skip empty/whitespace-only drained fragments. state_processor's
+            # `frame.text.strip()` filter at the submit boundary makes this
+            # defensive today, but a future side channel (replay harness,
+            # hypothesis test) could enqueue empties — without filtering,
+            # `" ".join(["foo", "", "bar"])` produces a double-space that
+            # confuses the LLM and inflates the coalesce count.
+            if item.strip():
+                joined.append(item)
         joined_text = " ".join(joined)
         if len(joined) > 1:
             log.info(
