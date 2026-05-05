@@ -325,11 +325,10 @@ class CallSessionRunner:
             # post-close guidance ("After your close, if the rep volunteers
             # extra info, ack briefly and stay phase: complete", lines 61-62
             # of rep_turn.v1.txt) counts on us routing those acks back
-            # through the rep LLM — reinforced by rule #9's anti-silence
-            # rule. Teardown is owned by the pipeline observer — when
-            # transport disconnects, the state processor calls
-            # `runner.stop()`, which cancels this consumer. The JSONL
-            # write happens inside `_run_turn` the moment
+            # through the rep LLM. Teardown is owned by the pipeline
+            # observer — when transport disconnects, the state processor
+            # calls `runner.stop()`, which cancels this consumer. The
+            # JSONL write happens inside `_run_turn` the moment
             # `completion_reason` is first set; further turns past the
             # close are no-ops on the one-shot guard.
 
@@ -357,14 +356,9 @@ class CallSessionRunner:
             try:
                 item = self.in_queue.get_nowait()
             except asyncio.QueueEmpty:
-                # Single-consumer architecture means the only writer is
-                # `submit_transcript` (sync) and the only reader is this
-                # method (sync get_nowait) — empty() lying would mean a
-                # concurrent drain is happening, which is itself a bug.
-                log.warning(
-                    "coalesce_queue_race",
-                    joined_so_far=len(joined),
-                )
+                # Single-consumer architecture; hitting this means a
+                # concurrent drain crept in — surface it.
+                log.warning("coalesce_queue_race", joined_so_far=len(joined))
                 break
             joined.append(item)
         joined_text = " ".join(joined)
@@ -387,22 +381,21 @@ class CallSessionRunner:
         the worker the file write completes regardless of cancellation in
         the awaiter. Flag flips in `finally` so the at-most-once invariant
         holds in every cancel scenario except the narrow window where
-        cancel lands BEFORE `_append_benefits_record` dispatches the
-        worker (during the `json.dumps` prelude) — in that case the
-        record is lost but we never double-write. Trade is consistent
-        with `_append_benefits_record`'s "best-effort, logged not raised"
-        contract.
+        cancel lands BEFORE the worker is dispatched (during the
+        `json.dumps` prelude) — record lost, never double-write.
 
-        The `except Exception` is C1 from review: `_append_benefits_record`
-        only catches `(TypeError, ValueError)` around the dumps and
-        `OSError` around `to_thread`. Anything else (RuntimeError from a
-        shut-down default executor, ValidationError from a future
-        custom-serializer field, UnicodeEncodeError from a worker, etc.)
-        would otherwise propagate out of `_run_turn` → out of `_consume`
-        → kill the consumer task → land in `_on_consumer_done` as a
-        misleading `consumer_died` while the flag is already set,
-        permanently disabling `stop()`'s retry. Catch + log + don't raise
-        keeps the failure observable AND keeps the consumer alive."""
+        `except Exception` keeps the consumer alive when an unexpected
+        error type slips past `_append_benefits_record`'s narrow catches
+        (e.g., RuntimeError from executor shutdown). Without it, the
+        exception would propagate out of `_run_turn`, kill the consumer,
+        and `_on_consumer_done` would set a misleading `consumer_died`
+        while the flag was already in `finally`, permanently disabling
+        `stop()`'s retry. The cost: the call ends normally with the
+        original `completion_reason` and no JSONL line — discoverable
+        only via the error log. We pay that with a second, end-of-call-
+        clear `call_session_completed_without_deliverable` event so
+        `grep call_sid=X` finds the failure without having to scan all
+        error lines."""
         if self._benefits_recorded:
             return
         if self.session.completion_reason is None:
@@ -415,14 +408,20 @@ class CallSessionRunner:
         try:
             await _append_benefits_record(self.session)
         except asyncio.CancelledError:
-            # Visibility for I1 from review: without this log, an
-            # investigator sees `call_session_complete` immediately above
-            # and no JSONL line, with no signal distinguishing "we tried
-            # but were cancelled" from "the writer crashed silently."
+            # Without this log, an investigator sees `call_session_complete`
+            # immediately above and no JSONL line, with no signal
+            # distinguishing "we tried but were cancelled" from "the writer
+            # crashed silently."
             log.warning(
                 "benefits_record_skipped_due_to_cancel",
                 call_sid=self.session.call_sid,
                 reason=self.session.completion_reason,
+            )
+            log.error(
+                "call_session_completed_without_deliverable",
+                call_sid=self.session.call_sid,
+                reason=self.session.completion_reason,
+                cause="cancelled",
             )
             raise
         except Exception as exc:
@@ -431,6 +430,13 @@ class CallSessionRunner:
                 call_sid=self.session.call_sid,
                 error_class=type(exc).__name__,
                 error=str(exc),
+            )
+            log.error(
+                "call_session_completed_without_deliverable",
+                call_sid=self.session.call_sid,
+                reason=self.session.completion_reason,
+                cause="record_unexpected_error",
+                error_class=type(exc).__name__,
             )
         finally:
             self._benefits_recorded = True

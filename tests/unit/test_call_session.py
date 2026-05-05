@@ -646,7 +646,7 @@ async def test_consumer_keeps_running_after_complete_call_for_post_close_acks(
         assert consumer is not None and not consumer.done(), (
             "consumer should still be alive after complete_call so post-close "
             "user utterances can route to the LLM — the rep persona prompt's "
-            "post-close ack paragraph (rep_turn.v1.txt:61-62) counts on this"
+            "post-close ack paragraph at rep_turn.v1.txt:61-62 counts on this"
         )
         # Drive the actual post-close turn — locks the load-bearing claim
         # that subsequent transcripts produce a real LLM call rather than
